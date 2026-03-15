@@ -1,0 +1,22 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+requests==2.32.3
+openpyxl==3.1.4
+python-dotenv==1.0.1
+
+# Database
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.31
+
+# Auth — JWT
+python-jose[cryptography]==3.3.0
+
+# Background scheduler — Jira sync
+apscheduler==3.10.4
+
+# Anthropic AI — manual entry parsing
+anthropic==0.29.0
+
+# Google Gemini AI (free tier — replaces Anthropic)
+google-generativeai==0.7.2
+python-dateutil==2.9.0

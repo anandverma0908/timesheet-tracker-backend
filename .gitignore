@@ -1,6 +1,5 @@
 venv
 .env
-.env.example
 setup.json
 pass.json
 *.json

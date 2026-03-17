@@ -7,3 +7,4 @@ trackly_backup.sql
 *.sql # or be more specific
 sync_employees.js
 trackly_backup.sql
+create_all_users.sh

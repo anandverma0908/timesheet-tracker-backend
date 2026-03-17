@@ -219,15 +219,23 @@ class SummaryByUser(BaseModel):
     email:       Optional[str]      = None
     role:        Optional[str]      = None
     pod:         Optional[str]      = None
+    title:       Optional[str]      = None
     status:      Optional[str]      = None
-    manager:     Optional[str]      = None   # name of the person who invited them
+    manager:     Optional[str]      = None
     user_id:     Optional[str]      = None
     last_login:  Optional[str]      = None
+
+class SummaryByIssueType(BaseModel):
+    issue_type: str
+    hours:      float
+    tickets:    int
+    pct:        float   # percentage of total hours
 
 class SummaryOut(BaseModel):
     by_pod:        List[SummaryByPod]
     by_client:     List[SummaryByClient]
     by_user:       List[SummaryByUser]
+    by_issue_type: List[SummaryByIssueType] = []
     total_tickets: int
     total_hours:   float
 

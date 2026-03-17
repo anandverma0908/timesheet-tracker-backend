@@ -37,7 +37,7 @@ from models import (
     InviteUserRequest, UpdateUserRequest,
     ManualEntryCreate, ManualEntryUpdate, ManualEntryOut, ManualEntryBulkCreate,
     ActivityItem, SyncStatusOut, FiltersOut,
-    SummaryOut, SummaryByPod, SummaryByClient, SummaryByUser,
+    SummaryOut, SummaryByPod, SummaryByClient, SummaryByUser, SummaryByIssueType,
     TicketOut, TicketsOut, WorklogOut,
 )
 from sync import sync_org, sync_all_orgs, get_last_sync
@@ -472,35 +472,123 @@ def sync_status(
 # FILTERS  (dropdown options — from DB, fast)
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _get_visible_users(db, org_id: str, current_user: User) -> list:
+    """
+    Returns names of users visible to current_user based on org hierarchy.
+    - engineering_manager: all users in org with matching pods
+    - tech_lead: self + direct reports (reporting_to == emp_no)
+    - team_member: only self
+    """
+    if current_user.role == "admin":
+        all_u = db.query(User).filter(User.org_id == org_id, User.status == "active").all()
+        return [u.name for u in all_u if u.name]
+
+    if current_user.role == "engineering_manager":
+        # Get all users whose emp_no chains up to this manager
+        all_u = db.query(User).filter(User.org_id == org_id, User.status == "active").all()
+        emp_map = {u.emp_no: u for u in all_u if u.emp_no}
+        def is_under(u: User) -> bool:
+            visited = set()
+            current = u
+            while current and current.reporting_to:
+                if current.reporting_to in visited:
+                    break
+                visited.add(current.reporting_to)
+                mgr = emp_map.get(current.reporting_to)
+                if not mgr:
+                    break
+                if mgr.emp_no == current_user.emp_no:
+                    return True
+                current = mgr
+            return False
+        return [u.name for u in all_u if u.name and (u.emp_no == current_user.emp_no or is_under(u))]
+
+    if current_user.role == "tech_lead":
+        # Self + direct reports only
+        direct = db.query(User).filter(
+            User.org_id      == org_id,
+            User.reporting_to == current_user.emp_no,
+            User.status      == "active",
+        ).all()
+        names = [u.name for u in direct if u.name]
+        if current_user.name:
+            names = [current_user.name] + names
+        return names
+
+    return [current_user.name] if current_user.name else []
+
+
 @app.get("/api/filters", response_model=FiltersOut)
 def get_filters(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     org_id = user.org_id
     org    = db.query(Organisation).filter(Organisation.id == org_id).first()
-    base   = db.query(JiraTicket).filter(JiraTicket.org_id == org_id)
 
-    # Apply active project filter for users/clients/pods
-    # (so sidebar shows only relevant PODs and clients for active projects)
+    # ── Base ticket query with org-level project filter ───────────────────────
+    base = db.query(JiraTicket).filter(JiraTicket.org_id == org_id)
     if org and org.jira_project_key:
         active = [p.strip() for p in org.jira_project_key.split(",") if p.strip()]
         if active:
             base = base.filter(JiraTicket.project_key.in_(active))
 
-    # Scope for tech_lead / team_member
-    if user.role in ("tech_lead", "team_member") and user.pod:
-        base = base.filter(JiraTicket.pod == user.pod)
+    # ── Role-based scoping ────────────────────────────────────────────────────
+    if user.role == "admin":
+        # Admin sees everything — no restrictions
+        tickets = base.all()
 
-    tickets = base.all()
+        return FiltersOut(
+            users    = sorted(set(t.assignee    for t in tickets if t.assignee)),
+            clients  = sorted(set(t.client      for t in tickets if t.client)),
+            pods     = sorted(set(t.pod         for t in tickets if t.pod)),
+            projects = sorted(set(t.project_key for t in tickets if t.project_key)),
+        )
 
-    # Projects list: always return ALL projects (unfiltered)
-    # so the Settings page can show all available projects to pick from
-    all_tickets = db.query(JiraTicket).filter(JiraTicket.org_id == org_id).all()
+    # For non-admin: scope pods to what the user has access to
+    user_pods = [p.strip() for p in (user.pod or "").split(",") if p.strip()]
 
-    return FiltersOut(
-        users    = sorted(set(t.assignee    for t in tickets     if t.assignee)),
-        clients  = sorted(set(t.client      for t in tickets     if t.client)),
-        pods     = sorted(set(t.pod         for t in tickets     if t.pod)),
-        projects = sorted(set(t.project_key for t in all_tickets if t.project_key)),
-    )
+    if user.role == "engineering_manager":
+        # EM sees all tickets in their pods
+        if user_pods:
+            base = base.filter(JiraTicket.pod.in_(user_pods))
+        tickets = base.all()
+
+        # Users = everyone whose reportingTo matches this user's emp_no
+        # + their own direct reports recursively (just 1 level for now)
+        visible_users = _get_visible_users(db, org_id, user)
+
+        return FiltersOut(
+            users    = sorted(visible_users),
+            clients  = sorted(set(t.client      for t in tickets if t.client)),
+            pods     = sorted(user_pods),
+            projects = sorted(set(t.project_key for t in tickets if t.project_key)),
+        )
+
+    elif user.role == "tech_lead":
+        # Tech lead sees their pods only
+        if user_pods:
+            base = base.filter(JiraTicket.pod.in_(user_pods))
+        tickets = base.all()
+
+        visible_users = _get_visible_users(db, org_id, user)
+
+        return FiltersOut(
+            users    = sorted(visible_users),
+            clients  = sorted(set(t.client for t in tickets if t.client)),
+            pods     = sorted(user_pods),
+            projects = sorted(set(t.project_key for t in tickets if t.project_key)),
+        )
+
+    else:
+        # team_member / finance_viewer — only self, own pods
+        if user_pods:
+            base = base.filter(JiraTicket.pod.in_(user_pods))
+        tickets = base.all()
+
+        return FiltersOut(
+            users    = [user.name] if user.name else [],
+            clients  = sorted(set(t.client for t in tickets if t.client)),
+            pods     = sorted(user_pods),
+            projects = sorted(set(t.project_key for t in tickets if t.project_key)),
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -522,7 +610,77 @@ def get_summary(
         db, current_user.org_id, current_user,
         date_from, date_to, user_filter, client, pod, project
     )
-    return _build_summary(tickets)
+    scoped_user = user_filter or (current_user.name if current_user.role == "team_member" else None)
+
+    summary = _build_summary(tickets, scoped_user=scoped_user, date_from=date_from, date_to=date_to)
+
+    # ── Merge manual entries hours into summary ───────────────────────────────
+    me_q = (db.query(ManualEntry, User)
+            .join(User, ManualEntry.user_id == User.id)
+            .filter(ManualEntry.org_id == current_user.org_id,
+                    ManualEntry.status  == "confirmed"))
+    if date_from: me_q = me_q.filter(ManualEntry.entry_date >= date_from)
+    if date_to:   me_q = me_q.filter(ManualEntry.entry_date <= date_to)
+    if client:
+        cl = [c.strip() for c in client.split(",") if c.strip()]
+        me_q = me_q.filter(ManualEntry.client.in_(cl) if len(cl) > 1 else ManualEntry.client == cl[0])
+    if pod:
+        pl = [p.strip() for p in pod.split(",") if p.strip()]
+        me_q = me_q.filter(ManualEntry.pod.in_(pl) if len(pl) > 1 else ManualEntry.pod == pl[0])
+    if scoped_user:
+        me_q = me_q.filter(User.name == scoped_user)
+
+    # Build a map of manual hours per user
+    manual_hours: dict = {}
+    for entry, u in me_q.all():
+        manual_hours[u.name] = manual_hours.get(u.name, 0) + (entry.hours or 0)
+
+    # Merge into existing by_user — add hours, keep tickets unchanged
+    existing = {u.user: u for u in summary.by_user}
+    for name, hrs in manual_hours.items():
+        if name in existing:
+            existing[name].hours = round(existing[name].hours + hrs, 2)
+        else:
+            existing[name] = SummaryByUser(user=name, hours=round(hrs, 2), tickets=0, clients=[])
+
+    summary.by_user    = sorted(existing.values(), key=lambda x: -x.hours)
+    summary.total_hours = round(summary.total_hours + sum(manual_hours.values()), 2)
+
+    # For non-admin roles, scope by_user to visible reportees
+    if current_user.role != "admin":
+        visible = set(_get_visible_users(db, current_user.org_id, current_user))
+
+        # Remove self — managers/leads see their reports, not themselves
+        visible.discard(current_user.name)
+
+        # Filter out users not in visible scope
+        summary.by_user = [u for u in summary.by_user if u.user in visible]
+
+        # POD filter: only show users who worked in that pod (remove zeros)
+        # Client filter: show all visible users, zeros allowed
+        # No filter: show all visible users, zeros allowed
+        if not pod:
+            # Client filter or no filter — add all visible users including zeros
+            existing_users = {u.user for u in summary.by_user}
+            for name in visible:
+                if name and name not in existing_users:
+                    summary.by_user.append(SummaryByUser(
+                        user=name, hours=0, tickets=0, clients=[]
+                    ))
+        # If pod filter active: do NOT add zero-hour users — they don't belong to that pod
+
+        # Re-sort by hours desc
+        summary.by_user = sorted(summary.by_user, key=lambda x: -x.hours)
+
+    # Enrich by_user with title from users table
+    all_users = db.query(User).filter(User.org_id == current_user.org_id).all()
+    user_map  = {u.name: u for u in all_users if u.name}
+    for u in summary.by_user:
+        db_user = user_map.get(u.user)
+        if db_user:
+            u.title = db_user.title
+
+    return summary
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -569,6 +727,8 @@ def get_engineer_stats(
     user_filter:  str = Query(..., alias="user"),
     date_from:    Optional[str] = Query(None),
     date_to:      Optional[str] = Query(None),
+    pod:          Optional[str] = Query(None),
+    client:       Optional[str] = Query(None),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -592,6 +752,12 @@ def get_engineer_stats(
         active = [p.strip() for p in org.jira_project_key.split(",") if p.strip()]
         if active:
             q = q.filter(JiraTicket.project_key.in_(active))
+    if pod:
+        pod_list = [p.strip() for p in pod.split(",") if p.strip()]
+        q = q.filter(JiraTicket.pod.in_(pod_list) if len(pod_list) > 1 else JiraTicket.pod == pod_list[0])
+    if client:
+        client_list = [c.strip() for c in client.split(",") if c.strip()]
+        q = q.filter(JiraTicket.client.in_(client_list) if len(client_list) > 1 else JiraTicket.client == client_list[0])
     if date_from:
         q = q.filter(JiraTicket.jira_updated >= date_from)
     if date_to:
@@ -860,16 +1026,21 @@ def get_manual_entries(
         .filter(ManualEntry.org_id == current_user.org_id)
     )
 
-    # Team members / tech leads only see their own entries
-    if current_user.role in ("team_member", "tech_lead"):
+    # team_member: only own entries (cannot view others)
+    # tech_lead/manager/admin: can view others via user_filter param
+    if current_user.role == "team_member":
         query = query.filter(ManualEntry.user_id == current_user.id)
     elif user_filter:
         query = query.filter(User.name == user_filter)
 
     if date_from: query = query.filter(ManualEntry.entry_date >= date_from)
     if date_to:   query = query.filter(ManualEntry.entry_date <= date_to)
-    if pod:       query = query.filter(ManualEntry.pod    == pod)
-    if client:    query = query.filter(ManualEntry.client == client)
+    if pod:
+        pl = [p.strip() for p in pod.split(",") if p.strip()]
+        query = query.filter(ManualEntry.pod.in_(pl) if len(pl) > 1 else ManualEntry.pod == pl[0])
+    if client:
+        cl = [c.strip() for c in client.split(",") if c.strip()]
+        query = query.filter(ManualEntry.client.in_(cl) if len(cl) > 1 else ManualEntry.client == cl[0])
 
     results = query.order_by(ManualEntry.entry_date.desc()).all()
 
@@ -1083,7 +1254,9 @@ def _query_tickets(
             q = q.filter(JiraTicket.project_key.in_(active))
 
     # ── Static filters ────────────────────────────────────────────────────────
-    if client:  q = q.filter(JiraTicket.client == client)
+    if client:
+        client_list = [c.strip() for c in client.split(",") if c.strip()]
+        q = q.filter(JiraTicket.client.in_(client_list) if len(client_list) > 1 else JiraTicket.client == client_list[0])
     if project: q = q.filter(JiraTicket.project_key == project)
     if pod:
         pod_list = [p.strip() for p in pod.split(",") if p.strip()]
@@ -1111,18 +1284,12 @@ def _query_tickets(
         ))
         # Date filter: match worklog date (user may log on old tickets)
         if date_from or date_to:
+            # Only use worklog date — tickets where user logged time in the period
+            # Drop assignee+jira_updated fallback to avoid pulling extra tickets
             wl_cond = Worklog.author == target_user
             if date_from: wl_cond = wl_cond & (Worklog.log_date >= date_from)
             if date_to:   wl_cond = wl_cond & (Worklog.log_date <= date_to)
-
-            assigned_cond = JiraTicket.assignee == target_user
-            if date_from: assigned_cond = assigned_cond & (JiraTicket.jira_updated >= date_from)
-            if date_to:   assigned_cond = assigned_cond & (JiraTicket.jira_updated <= date_to)
-
-            q = q.filter(or_(
-                JiraTicket.worklogs.any(wl_cond),
-                assigned_cond
-            ))
+            q = q.filter(JiraTicket.worklogs.any(wl_cond))
     else:
         # No user scope — admin/manager general query — use jira_updated
         if date_from: q = q.filter(JiraTicket.jira_updated >= date_from)
@@ -1131,17 +1298,33 @@ def _query_tickets(
     return q.order_by(JiraTicket.jira_updated.desc()).all()
 
 
-def _build_summary(tickets) -> SummaryOut:
-    by_pod    = defaultdict(lambda: {"hours": 0, "tickets": set(), "clients": set()})
-    by_client = defaultdict(lambda: {"hours": 0, "tickets": set(), "users": set()})
-    by_user   = defaultdict(lambda: {"hours": 0, "tickets": set(), "clients": set()})
+def _build_summary(tickets, scoped_user=None, date_from=None, date_to=None) -> SummaryOut:
+    """
+    Build summary from tickets.
+    scoped_user: if set, only count worklogs by this user (for team_member view).
+    date_from/date_to: filter worklogs by date when scoped_user is set.
+    """
+    from datetime import date as _date
+
+    by_pod        = defaultdict(lambda: {"hours": 0, "tickets": set(), "clients": set()})
+    by_client     = defaultdict(lambda: {"hours": 0, "tickets": set(), "users": set()})
+    by_user       = defaultdict(lambda: {"hours": 0, "tickets": set(), "clients": set()})
+    by_issue_type = defaultdict(lambda: {"hours": 0, "tickets": set()})
 
     total_hours = 0
 
     for t in tickets:
         if t.worklogs:
-            # Attribute hours to each individual worklog author
             for wl in t.worklogs:
+                # If scoped to a user, only count their worklogs in the date range
+                if scoped_user:
+                    if wl.author != scoped_user:
+                        continue
+                    if date_from and wl.log_date and str(wl.log_date) < date_from:
+                        continue
+                    if date_to and wl.log_date and str(wl.log_date) > date_to:
+                        continue
+
                 h      = wl.hours or 0
                 author = wl.author or t.assignee
                 total_hours += h
@@ -1158,8 +1341,13 @@ def _build_summary(tickets) -> SummaryOut:
                     by_user[author]["hours"] += h
                     by_user[author]["tickets"].add(t.jira_key)
                     if t.client: by_user[author]["clients"].add(t.client)
+                if t.issue_type:
+                    by_issue_type[t.issue_type]["hours"] += h
+                    by_issue_type[t.issue_type]["tickets"].add(t.jira_key)
         else:
-            # No worklogs — fall back to assignee
+            # No worklogs — use ticket-level hours, attributed to assignee
+            if scoped_user and t.assignee != scoped_user:
+                continue
             h = t.hours_spent or 0
             total_hours += h
             if t.pod:
@@ -1174,6 +1362,11 @@ def _build_summary(tickets) -> SummaryOut:
                 by_user[t.assignee]["hours"] += h
                 by_user[t.assignee]["tickets"].add(t.jira_key)
                 if t.client: by_user[t.assignee]["clients"].add(t.client)
+            if t.issue_type:
+                by_issue_type[t.issue_type]["hours"] += h
+                by_issue_type[t.issue_type]["tickets"].add(t.jira_key)
+
+    total_issue_hours = sum(v["hours"] for v in by_issue_type.values()) or 1
 
     return SummaryOut(
         by_pod    = sorted([SummaryByPod(pod=k, hours=round(v["hours"],2),
@@ -1185,6 +1378,12 @@ def _build_summary(tickets) -> SummaryOut:
         by_user   = sorted([SummaryByUser(user=k, hours=round(v["hours"],2),
                             tickets=len(v["tickets"]), clients=list(v["clients"]))
                             for k,v in by_user.items()], key=lambda x:-x.hours),
+        by_issue_type = sorted([SummaryByIssueType(
+                            issue_type=k,
+                            hours=round(v["hours"],2),
+                            tickets=len(v["tickets"]),
+                            pct=round(v["hours"] / total_issue_hours * 100, 1))
+                            for k,v in by_issue_type.items()], key=lambda x:-x.hours),
         total_tickets = len(tickets),
         total_hours   = round(total_hours, 2),
     )

@@ -3,3 +3,5 @@ venv
 setup.json
 pass.json
 *.json
+trackly_backup.sql
+*.sql # or be more specific

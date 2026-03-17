@@ -70,10 +70,14 @@ class User(Base):
     name       = Column(String(200), nullable=False)
     email      = Column(String(200), nullable=False)
     role       = Column(SAEnum(*USER_ROLES,    name="user_role"),   nullable=False, default="team_member")
-    pod        = Column(String(100), nullable=True)
-    status     = Column(SAEnum(*USER_STATUSES, name="user_status"), nullable=False, default="pending")
-    invited_by = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=True)
-    password_hash = Column(Text, nullable=True)  # bcrypt hash, null = no password set
+    pod          = Column(String(100),  nullable=True)   # comma-separated pod keys e.g. "DPAI,EDM"
+    pods         = Column(Text,         nullable=True)   # alias — same as pod, comma-separated
+    emp_no       = Column(String(50),   nullable=True)   # Keka employee number e.g. "3SC1463"
+    title        = Column(String(200),  nullable=True)   # job title e.g. "SDE3"
+    reporting_to = Column(String(50),   nullable=True)   # emp_no of manager
+    status       = Column(SAEnum(*USER_STATUSES, name="user_status"), nullable=False, default="pending")
+    invited_by   = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=True)
+    password_hash = Column(Text, nullable=True)  # bcrypt hash
     last_login = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=now)
     updated_at = Column(DateTime, default=now, onupdate=now)

@@ -27,14 +27,18 @@ class VerifyOtpRequest(BaseModel):
     code:  str
 
 class UserOut(BaseModel):
-    id:         str
-    name:       str
-    email:      str
-    role:       str
-    pod:        Optional[str] = None
-    status:     str
-    org_id:     str
-    last_login: Optional[datetime] = None
+    id:           str
+    name:         str
+    email:        str
+    role:         str
+    pod:          Optional[str]      = None
+    pods:         Optional[str]      = None
+    emp_no:       Optional[str]      = None
+    title:        Optional[str]      = None
+    reporting_to: Optional[str]      = None
+    status:       str
+    org_id:       str
+    last_login:   Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -77,6 +81,19 @@ class OrgOut(BaseModel):
 
 
 # ── Users ──────────────────────────────────────────────────────────────────────
+
+class EmployeeSyncItem(BaseModel):
+    empNo:       str
+    name:        str
+    email:       str
+    title:       str
+    role:        str
+    pod:         List[str]           # list of pod keys
+    reportingTo: Optional[str] = None
+
+class EmployeeSyncRequest(BaseModel):
+    employees: List[EmployeeSyncItem]
+
 
 class InviteUserRequest(BaseModel):
     name:     str
@@ -194,10 +211,18 @@ class SummaryByClient(BaseModel):
     users:   List[str]
 
 class SummaryByUser(BaseModel):
-    user:    str
-    hours:   float
-    tickets: int
-    clients: List[str]
+    user:        str
+    hours:       float
+    tickets:     int
+    clients:     List[str]
+    # org profile fields — populated from users table
+    email:       Optional[str]      = None
+    role:        Optional[str]      = None
+    pod:         Optional[str]      = None
+    status:      Optional[str]      = None
+    manager:     Optional[str]      = None   # name of the person who invited them
+    user_id:     Optional[str]      = None
+    last_login:  Optional[str]      = None
 
 class SummaryOut(BaseModel):
     by_pod:        List[SummaryByPod]

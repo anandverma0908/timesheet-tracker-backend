@@ -7,17 +7,31 @@ python-dotenv==1.0.1
 # Database
 psycopg2-binary==2.9.9
 sqlalchemy==2.0.31
+alembic==1.16.5
+
+# Settings
+pydantic-settings==2.11.0
 
 # Auth — JWT
 python-jose[cryptography]==3.3.0
 
-# Background scheduler — Jira sync
+# Background scheduler
 apscheduler==3.10.4
 
-# Anthropic AI — manual entry parsing
-anthropic==0.29.0
-
-# Google Gemini AI (free tier — replaces Anthropic)
-google-generativeai==0.7.2
-python-dateutil==2.9.0
+# Password hashing
 bcrypt==4.0.1
+
+# Date parsing
+python-dateutil==2.9.0
+
+# File uploads
+python-multipart==0.0.12
+
+# HTTP client (NOVA / Ollama)
+httpx==0.27.2
+
+# ── NOVA AI (Week 1) ──────────────────────────────────────────────────────────
+sentence-transformers==3.0.1
+torch==2.4.0
+scikit-learn==1.5.1
+numpy==1.26.4

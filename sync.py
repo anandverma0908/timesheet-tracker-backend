@@ -12,9 +12,11 @@ from datetime import datetime, date
 from typing import Optional
 from sqlalchemy.orm import Session
 
-from database import (
-    SessionLocal, Organisation, JiraTicket, Worklog, SyncLog, gen_uuid
-)
+from app.core.database import SessionLocal
+from app.models.organisation import Organisation
+from app.models.ticket import JiraTicket, Worklog
+from app.models.audit import SyncLog
+from app.models.base import gen_uuid
 from jira_client import JiraClient
 
 

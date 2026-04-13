@@ -1,0 +1,20 @@
+"""
+app/models — Import all ORM models here so SQLAlchemy's metadata knows about them.
+This file is the single import point for Alembic and create_tables().
+"""
+
+from app.core.database import Base  # noqa: F401
+
+from app.models.organisation import Organisation  # noqa: F401
+from app.models.user         import User          # noqa: F401
+from app.models.ticket       import (             # noqa: F401
+    JiraTicket, Worklog, TicketComment, TicketAttachment, TicketEmbedding,
+)
+from app.models.wiki         import (             # noqa: F401
+    WikiSpace, WikiPage, WikiVersion, WikiEmbedding,
+)
+from app.models.manual_entry import ManualEntry   # noqa: F401
+from app.models.audit        import AuditLog, SyncLog  # noqa: F401
+from app.models.sprint       import Sprint, Standup, KnowledgeGap  # noqa: F401
+from app.models.notification import Notification  # noqa: F401
+from app.models.client       import ClientBudget, BurnRateAlert  # noqa: F401

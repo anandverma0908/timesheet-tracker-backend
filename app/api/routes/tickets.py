@@ -67,6 +67,30 @@ def _write_audit(db: Session, entity_id: str, org_id: str, user_id: str, action:
     ))
 
 
+def _resolve_ticket(db: Session, org_id: str, ticket_id: str) -> Optional[JiraTicket]:
+    """Look up by UUID id first, then fallback to jira_key."""
+    # Only query by id if ticket_id looks like a UUID; otherwise PG throws a DataError
+    # trying to cast a jira key (e.g. 'SNOP-147') to the UUID column type.
+    try:
+        uuid.UUID(ticket_id)
+    except ValueError:
+        return db.query(JiraTicket).filter(
+            JiraTicket.jira_key == ticket_id,
+            JiraTicket.org_id == org_id,
+            JiraTicket.is_deleted == False,
+        ).first()
+
+    return db.query(JiraTicket).filter(
+        JiraTicket.id == ticket_id,
+        JiraTicket.org_id == org_id,
+        JiraTicket.is_deleted == False,
+    ).first() or db.query(JiraTicket).filter(
+        JiraTicket.jira_key == ticket_id,
+        JiraTicket.org_id == org_id,
+        JiraTicket.is_deleted == False,
+    ).first()
+
+
 def _to_out(t: JiraTicket) -> dict:
     return {
         "id":             t.id,
@@ -82,6 +106,7 @@ def _to_out(t: JiraTicket) -> dict:
         "assignee":       t.assignee,
         "assignee_email": t.assignee_email,
         "story_points":   t.story_points,
+        "labels":         t.labels or [],
         "sprint_id":      t.sprint_id,
         "is_deleted":     t.is_deleted,
         "created_at":     t.synced_at,
@@ -128,7 +153,7 @@ async def nl_create_ticket(
         description=fields.get("description"),
         issue_type=fields.get("issue_type", "Task"),
         priority=fields.get("priority", "Medium"),
-        status="Backlog",
+        status="To Do",
         pod=fields.get("pod"),
         client=fields.get("client"),
         story_points=fields.get("story_points"),
@@ -161,6 +186,7 @@ async def ai_analyze(
         fields=result.get("fields", {}),
         duplicates=result.get("duplicates", []),
         has_duplicates=result.get("has_duplicates", False),
+        confidence=result.get("confidence"),
     )
 
 
@@ -182,12 +208,14 @@ async def create_ticket(
         description=body.description,
         issue_type=body.issue_type or "Task",
         priority=body.priority or "Medium",
-        status=body.status or "Backlog",
+        status=body.status or "To Do",
         pod=body.pod,
         client=body.client,
         assignee=body.assignee,
         assignee_email=body.assignee_email,
         story_points=body.story_points,
+        labels=body.labels or [],
+        sprint_id=body.sprint_id,
         is_deleted=False,
     )
     db.add(ticket)
@@ -243,11 +271,7 @@ async def get_ticket(
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ):
-    ticket = db.query(JiraTicket).filter(
-        JiraTicket.id == ticket_id,
-        JiraTicket.org_id == user.org_id,
-        JiraTicket.is_deleted == False,
-    ).first()
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
     return TicketOut(**_to_out(ticket))
@@ -261,11 +285,7 @@ async def update_ticket(
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ):
-    ticket = db.query(JiraTicket).filter(
-        JiraTicket.id == ticket_id,
-        JiraTicket.org_id == user.org_id,
-        JiraTicket.is_deleted == False,
-    ).first()
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
 
@@ -289,11 +309,7 @@ async def delete_ticket(
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ):
-    ticket = db.query(JiraTicket).filter(
-        JiraTicket.id == ticket_id,
-        JiraTicket.org_id == user.org_id,
-        JiraTicket.is_deleted == False,
-    ).first()
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
     ticket.is_deleted = True
@@ -311,8 +327,32 @@ async def transition_status(
     if body.status not in VALID_STATUSES:
         raise HTTPException(400, f"Invalid status. Must be one of: {VALID_STATUSES}")
 
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
+    old_status    = ticket.status
+    ticket.status = body.status
+    _write_audit(db, ticket.id, user.org_id, user.id, "status_changed", {
+        "old": old_status, "new": body.status
+    })
+    db.commit()
+    db.refresh(ticket)
+    return TicketOut(**_to_out(ticket))
+
+
+@router.post("/{key}/status", response_model=TicketOut)
+async def transition_status_by_key(
+    key: str,
+    body: StatusTransition,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    if body.status not in VALID_STATUSES:
+        raise HTTPException(400, f"Invalid status. Must be one of: {VALID_STATUSES}")
+
     ticket = db.query(JiraTicket).filter(
-        JiraTicket.id == ticket_id,
+        JiraTicket.jira_key == key,
         JiraTicket.org_id == user.org_id,
         JiraTicket.is_deleted == False,
     ).first()
@@ -337,14 +377,12 @@ async def list_comments(
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ):
-    ticket = db.query(JiraTicket).filter(
-        JiraTicket.id == ticket_id, JiraTicket.org_id == user.org_id
-    ).first()
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
 
     comments = db.query(TicketComment).filter(
-        TicketComment.ticket_id == ticket_id,
+        TicketComment.ticket_id == ticket.id,
         TicketComment.is_deleted == False,
     ).order_by(TicketComment.created_at).all()
 
@@ -370,18 +408,14 @@ async def add_comment(
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ):
-    ticket = db.query(JiraTicket).filter(
-        JiraTicket.id == ticket_id,
-        JiraTicket.org_id == user.org_id,
-        JiraTicket.is_deleted == False,
-    ).first()
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
 
     from app.models.base import gen_uuid
     comment = TicketComment(
         id=gen_uuid(),
-        ticket_id=ticket_id,
+        ticket_id=ticket.id,
         author_id=user.id,
         body=body.body,
         parent_id=body.parent_id,
@@ -426,11 +460,7 @@ async def upload_attachment(
     db:   Session    = Depends(get_db),
     user: User       = Depends(get_current_user),
 ):
-    ticket = db.query(JiraTicket).filter(
-        JiraTicket.id == ticket_id,
-        JiraTicket.org_id == user.org_id,
-        JiraTicket.is_deleted == False,
-    ).first()
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
 
@@ -448,7 +478,7 @@ async def upload_attachment(
     from app.models.base import gen_uuid
     attachment = TicketAttachment(
         id=gen_uuid(),
-        ticket_id=ticket_id,
+        ticket_id=ticket.id,
         filename=file.filename or safe_name,
         filepath=dest,
         size_bytes=len(contents),
@@ -466,14 +496,12 @@ async def list_attachments(
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ):
-    ticket = db.query(JiraTicket).filter(
-        JiraTicket.id == ticket_id, JiraTicket.org_id == user.org_id
-    ).first()
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
 
     attachments = db.query(TicketAttachment).filter(
-        TicketAttachment.ticket_id == ticket_id
+        TicketAttachment.ticket_id == ticket.id
     ).order_by(TicketAttachment.created_at).all()
     return [AttachmentOut.model_validate(a) for a in attachments]
 
@@ -491,20 +519,7 @@ async def log_time(
     from app.models.ticket import Worklog
     import datetime
 
-    ticket = db.query(JiraTicket).filter(
-        JiraTicket.id == ticket_id,
-        JiraTicket.org_id == user.org_id,
-        JiraTicket.is_deleted == False,
-    ).first()
-
-    # Also try lookup by jira_key (frontend may pass key instead of UUID)
-    if not ticket:
-        ticket = db.query(JiraTicket).filter(
-            JiraTicket.jira_key == ticket_id,
-            JiraTicket.org_id   == user.org_id,
-            JiraTicket.is_deleted == False,
-        ).first()
-
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
 
@@ -554,15 +569,13 @@ async def ticket_activity(
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ):
-    ticket = db.query(JiraTicket).filter(
-        JiraTicket.id == ticket_id, JiraTicket.org_id == user.org_id
-    ).first()
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
 
     logs = db.query(AuditLog).filter(
         AuditLog.entity_type == "ticket",
-        AuditLog.entity_id   == ticket_id,
+        AuditLog.entity_id   == ticket.id,
     ).order_by(AuditLog.created_at.desc()).limit(50).all()
 
     result = []

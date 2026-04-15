@@ -33,6 +33,8 @@ class JiraTicket(Base):
     jira_updated             = Column(Date,   nullable=True)
     url                      = Column(String(500), nullable=True)
     sprint_id                = Column(UUID(as_uuid=False), nullable=True)
+    epic_id                  = Column(UUID(as_uuid=False), ForeignKey("epics.id"), nullable=True)
+    labels                   = Column(JSONB, nullable=True)
     is_deleted               = Column(Boolean, default=False, nullable=False)
     synced_at                = Column(DateTime, default=now, onupdate=now)
 

@@ -58,8 +58,8 @@ async def workload(
         "year":  y,
         "data": [
             {
-                "engineer":    r.assignee or "Unassigned",
-                "pod":         r.pod or "Unknown",
+                "engineer":    r.assignee or None,
+                "pod":         r.pod or None,
                 "total_hours": round(float(r.total_hours), 2),
             }
             for r in rows
@@ -87,10 +87,10 @@ async def pod_summary(
     # Aggregate by pod
     pods: dict = {}
     for row in pod_tickets:
-        p = row.pod or "Unknown"
+        p = row.pod or ""
         if p not in pods:
             pods[p] = {"pod": p, "statuses": {}, "total_hours": 0}
-        pods[p]["statuses"][row.status or "Unknown"] = row.count
+        pods[p]["statuses"][row.status or ""] = row.count
 
     # Add hours
     pod_hours = db.query(
@@ -104,7 +104,7 @@ async def pod_summary(
     ).group_by(JiraTicket.pod).all()
 
     for row in pod_hours:
-        p = row.pod or "Unknown"
+        p = row.pod or ""
         if p in pods:
             pods[p]["total_hours"] = round(float(row.total_hours), 2)
 

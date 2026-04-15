@@ -8,12 +8,14 @@ class TicketCreate(BaseModel):
     description:    Optional[str] = None
     issue_type:     Optional[str] = "Task"
     priority:       Optional[str] = "Medium"
-    status:         Optional[str] = "Backlog"
+    status:         Optional[str] = "To Do"
     pod:            Optional[str] = None
     client:         Optional[str] = None
     assignee:       Optional[str] = None
     assignee_email: Optional[str] = None
     story_points:   Optional[int] = None
+    labels:         Optional[List[str]] = None
+    sprint_id:      Optional[str] = None
     jira_key:       Optional[str] = None
 
 
@@ -45,6 +47,7 @@ class TicketOut(BaseModel):
     assignee:       Optional[str] = None
     assignee_email: Optional[str] = None
     story_points:   Optional[int] = None
+    labels:         Optional[List[str]] = None
     sprint_id:      Optional[str] = None
     is_deleted:     bool = False
     created_at:     Optional[datetime] = None
@@ -68,6 +71,7 @@ class AIAnalyzeOut(BaseModel):
     fields:         dict
     duplicates:     List[dict] = []
     has_duplicates: bool = False
+    confidence:     Optional[float] = None
 
 
 class CommentCreate(BaseModel):

@@ -74,6 +74,8 @@ async def list_sprints(
     q = db.query(Sprint).filter(Sprint.org_id == user.org_id)
     if status:
         q = q.filter(Sprint.status == status)
+    if project_id:
+        q = q.filter(Sprint.pod == project_id)
     sprints = q.order_by(Sprint.created_at.desc()).all()
 
     result = []
@@ -117,6 +119,7 @@ async def create_sprint(
         start_date=body.start_date,
         end_date=body.end_date,
         status="planning",
+        pod=body.project_id,
     )
     db.add(sprint)
     db.commit()

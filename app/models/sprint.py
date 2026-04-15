@@ -16,9 +16,13 @@ class Sprint(Base):
     end_date   = Column(Date,    nullable=True)
     status     = Column(String(50), default="planning")  # planning | active | completed
     velocity   = Column(Integer, nullable=True)
+    pod        = Column(String(100), nullable=True)
     created_at = Column(DateTime, default=now)
 
-    __table_args__ = (Index("ix_sp_org", "org_id"),)
+    __table_args__ = (
+        Index("ix_sp_org", "org_id"),
+        Index("ix_sp_pod", "pod"),
+    )
 
 
 class Standup(Base):

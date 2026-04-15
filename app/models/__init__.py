@@ -16,5 +16,6 @@ from app.models.wiki         import (             # noqa: F401
 from app.models.manual_entry import ManualEntry   # noqa: F401
 from app.models.audit        import AuditLog, SyncLog  # noqa: F401
 from app.models.sprint       import Sprint, Standup, KnowledgeGap  # noqa: F401
+from app.models.epic         import Epic  # noqa: F401
 from app.models.notification import Notification  # noqa: F401
 from app.models.client       import ClientBudget, BurnRateAlert  # noqa: F401

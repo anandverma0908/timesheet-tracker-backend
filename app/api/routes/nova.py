@@ -189,15 +189,16 @@ async def get_team_standups(
     for s in standups:
         member = db.query(UserModel).filter(UserModel.id == s.user_id).first()
         result.append({
-            "id":        s.id,
-            "user_id":   s.user_id,
-            "user_name": member.name if member else "Unknown",
-            "pod":       member.pod  if member else None,
-            "date":      s.date.isoformat(),
-            "yesterday": s.yesterday,
-            "today":     s.today,
-            "blockers":  s.blockers,
-            "is_shared": s.is_shared,
+            "id":             s.id,
+            "user_id":        s.user_id,
+            "engineer":       member.name if member else None,
+            "engineer_email": member.email if member else None,
+            "pod":            member.pod  if member else None,
+            "date":           s.date.isoformat(),
+            "yesterday":      s.yesterday,
+            "today":          s.today,
+            "blockers":       s.blockers,
+            "shared":         s.is_shared,
         })
 
     return {"date": target_date.isoformat(), "standups": result}

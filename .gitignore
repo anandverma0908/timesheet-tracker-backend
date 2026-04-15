@@ -1,10 +1,28 @@
-venv
+venv/
 .env
+
+# JSON secrets/config
 setup.json
 pass.json
 *.json
+
+# SQL backups
+*.sql
 trackly_backup.sql
-*.sql # or be more specific
+
+# Scripts
 sync_employees.js
-trackly_backup.sql
 create_all_users.sh
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# macOS
+.DS_Store
+
+# Uploads
+uploads/

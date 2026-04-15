@@ -16,6 +16,7 @@ from app.api.routes.sprints       import router as sprints_router
 from app.api.routes.notifications import router as notifications_router
 from app.api.routes.clients       import router as clients_router
 from app.api.routes.analytics     import router as analytics_router
+from app.api.routes.spaces        import router as spaces_router
 
 api_router = APIRouter()
 
@@ -29,3 +30,4 @@ api_router.include_router(sprints_router)
 api_router.include_router(notifications_router)
 api_router.include_router(clients_router)
 api_router.include_router(analytics_router)
+api_router.include_router(spaces_router)

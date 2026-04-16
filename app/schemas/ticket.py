@@ -17,6 +17,7 @@ class TicketCreate(BaseModel):
     labels:         Optional[List[str]] = None
     sprint_id:      Optional[str] = None
     jira_key:       Optional[str] = None
+    due_date:       Optional[str] = None
 
 
 class TicketUpdate(BaseModel):
@@ -31,6 +32,7 @@ class TicketUpdate(BaseModel):
     assignee_email: Optional[str] = None
     story_points:   Optional[int] = None
     sprint_id:      Optional[str] = None
+    due_date:       Optional[str] = None
 
 
 class TicketOut(BaseModel):
@@ -49,6 +51,7 @@ class TicketOut(BaseModel):
     story_points:   Optional[int] = None
     labels:         Optional[List[str]] = None
     sprint_id:      Optional[str] = None
+    due_date:       Optional[str] = None
     is_deleted:     bool = False
     created_at:     Optional[datetime] = None
 

@@ -92,10 +92,15 @@ def _resolve_ticket(db: Session, org_id: str, ticket_id: str) -> Optional[JiraTi
 
 
 def _to_out(t: JiraTicket) -> dict:
+    created = t.jira_created.isoformat() if t.jira_created else (t.synced_at.isoformat() if t.synced_at else None)
+    updated = t.jira_updated.isoformat() if t.jira_updated else (t.synced_at.isoformat() if t.synced_at else None)
     return {
         "id":             t.id,
+        "key":            t.jira_key,
         "org_id":         t.org_id,
         "jira_key":       t.jira_key,
+        "project_key":    t.project_key,
+        "project_name":   t.project_name,
         "summary":        t.summary,
         "description":    t.description,
         "issue_type":     t.issue_type,
@@ -108,8 +113,16 @@ def _to_out(t: JiraTicket) -> dict:
         "story_points":   t.story_points,
         "labels":         t.labels or [],
         "sprint_id":      t.sprint_id,
+        "due_date":       t.due_date.isoformat() if t.due_date else None,
+        "hours_spent":    t.hours_spent or 0,
+        "original_estimate_hours": t.original_estimate_hours or 0,
+        "remaining_estimate_hours": t.remaining_estimate_hours or 0,
+        "url":            t.url,
+        "worklogs":       [],
         "is_deleted":     t.is_deleted,
         "created_at":     t.synced_at,
+        "created":        created,
+        "updated":        updated,
     }
 
 
@@ -156,7 +169,9 @@ async def nl_create_ticket(
         status="To Do",
         pod=fields.get("pod"),
         client=fields.get("client"),
+        assignee=fields.get("assignee"),
         story_points=fields.get("story_points"),
+        labels=fields.get("labels") or [],
         is_deleted=False,
     )
     db.add(ticket)
@@ -216,6 +231,7 @@ async def create_ticket(
         story_points=body.story_points,
         labels=body.labels or [],
         sprint_id=body.sprint_id,
+        due_date=body.due_date,
         is_deleted=False,
     )
     db.add(ticket)

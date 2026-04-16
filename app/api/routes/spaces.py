@@ -11,6 +11,7 @@ from datetime import date, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
@@ -18,6 +19,14 @@ from app.core.database import get_db
 from app.core.dependencies import get_current_user
 
 router = APIRouter(prefix="/api/spaces", tags=["spaces"])
+
+
+class SpaceCreatePayload(BaseModel):
+    key: str
+    name: str
+    description: str
+    category: str
+    color: str
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -394,3 +403,82 @@ async def get_space_epics(
         }
         for e in epics
     ]
+
+
+@router.post("")
+async def create_space(
+    payload: SpaceCreatePayload,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """Create a new space by inserting a planning sprint for the POD."""
+    from app.models.sprint import Sprint
+
+    org_id = user.org_id
+    pod = payload.key.strip().upper()
+    if not pod:
+        raise HTTPException(status_code=400, detail="Space key is required")
+
+    existing = db.query(Sprint).filter(
+        Sprint.org_id == org_id,
+        Sprint.pod == pod,
+    ).first()
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Space '{pod}' already exists")
+
+    today = date.today()
+    sprint = Sprint(
+        org_id=org_id,
+        name=f"{payload.name} — Sprint 1",
+        goal=payload.description,
+        pod=pod,
+        status="planning",
+        start_date=today,
+        end_date=today + timedelta(days=14),
+    )
+    db.add(sprint)
+    db.commit()
+    return {"pod": pod, "name": payload.name, "status": "created"}
+
+
+@router.delete("/{pod}")
+async def delete_space(
+    pod: str,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """Delete a space and all associated data."""
+    from app.models.ticket import JiraTicket, Worklog
+    from app.models.sprint import Sprint
+    from app.models.epic import Epic
+
+    org_id = user.org_id
+
+    tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id == org_id,
+        JiraTicket.pod == pod,
+    ).all()
+    ticket_ids = [t.id for t in tickets]
+
+    if ticket_ids:
+        db.query(Worklog).filter(
+            Worklog.ticket_id.in_(ticket_ids),
+        ).delete(synchronize_session=False)
+
+        db.query(JiraTicket).filter(
+            JiraTicket.org_id == org_id,
+            JiraTicket.pod == pod,
+        ).delete(synchronize_session=False)
+
+    db.query(Sprint).filter(
+        Sprint.org_id == org_id,
+        Sprint.pod == pod,
+    ).delete(synchronize_session=False)
+
+    db.query(Epic).filter(
+        Epic.org_id == org_id,
+        Epic.pod == pod,
+    ).delete(synchronize_session=False)
+
+    db.commit()
+    return {"pod": pod, "status": "deleted"}

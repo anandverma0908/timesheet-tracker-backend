@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.dependencies import get_current_user, get_manager_up
+from app.core.dependencies import get_current_user, get_tech_lead_up
 
 router = APIRouter(prefix="/api/sprints", tags=["sprints"])
 
@@ -106,7 +106,7 @@ async def list_sprints(
 async def create_sprint(
     body: SprintCreate,
     db:   Session = Depends(get_db),
-    user = Depends(get_manager_up),
+    user = Depends(get_tech_lead_up),
 ):
     from app.models.sprint import Sprint
     from app.models.base import gen_uuid
@@ -175,7 +175,7 @@ async def get_sprint(
 async def start_sprint(
     sprint_id: str,
     db:   Session = Depends(get_db),
-    user = Depends(get_manager_up),
+    user = Depends(get_tech_lead_up),
 ):
     from app.models.sprint import Sprint
     from app.models.ticket import JiraTicket
@@ -221,7 +221,7 @@ async def start_sprint(
 async def complete_sprint(
     sprint_id: str,
     db:   Session = Depends(get_db),
-    user = Depends(get_manager_up),
+    user = Depends(get_tech_lead_up),
 ):
     from app.models.sprint import Sprint
     from app.models.ticket import JiraTicket

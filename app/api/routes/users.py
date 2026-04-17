@@ -24,6 +24,31 @@ async def list_users(
     return [UserOut.model_validate(u) for u in users]
 
 
+@router.get("/members")
+async def list_org_members(
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    """Return all active org members — accessible to any authenticated user."""
+    members = db.query(User).filter(
+        User.org_id == user.org_id,
+        User.status == "active",
+    ).order_by(User.name).all()
+    return [
+        {
+            "id":           u.id,
+            "name":         u.name,
+            "email":        u.email,
+            "role":         u.role,
+            "pod":          u.pod,
+            "emp_no":       u.emp_no,
+            "reporting_to": u.reporting_to,
+            "title":        u.title,
+        }
+        for u in members
+    ]
+
+
 @router.get("/{user_id}", response_model=UserOut)
 async def get_user(
     user_id: str,

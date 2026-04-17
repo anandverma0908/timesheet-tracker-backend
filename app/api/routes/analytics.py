@@ -74,6 +74,7 @@ async def pod_summary(
 ):
     """POD-level breakdown: ticket counts by status and total hours."""
     from app.models.ticket import JiraTicket, Worklog
+    from app.models.sprint import Sprint
 
     pod_tickets = db.query(
         JiraTicket.pod,
@@ -107,6 +108,15 @@ async def pod_summary(
         p = row.pod or ""
         if p in pods:
             pods[p]["total_hours"] = round(float(row.total_hours), 2)
+
+    # Include pods that exist as sprints but have no tickets yet
+    sprint_pods = db.query(Sprint.pod).filter(
+        Sprint.org_id == user.org_id,
+    ).distinct().all()
+    for (spod,) in sprint_pods:
+        p = spod or ""
+        if p not in pods:
+            pods[p] = {"pod": p, "statuses": {}, "total_hours": 0}
 
     return list(pods.values())
 

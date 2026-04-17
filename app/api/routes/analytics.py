@@ -85,10 +85,12 @@ async def pod_summary(
         JiraTicket.is_deleted == False,
     ).group_by(JiraTicket.pod, JiraTicket.status).all()
 
-    # Aggregate by pod
+    # Aggregate by pod (skip tickets with no pod name)
     pods: dict = {}
     for row in pod_tickets:
-        p = row.pod or ""
+        p = (row.pod or "").strip()
+        if not p:
+            continue
         if p not in pods:
             pods[p] = {"pod": p, "statuses": {}, "total_hours": 0}
         pods[p]["statuses"][row.status or ""] = row.count
@@ -109,13 +111,13 @@ async def pod_summary(
         if p in pods:
             pods[p]["total_hours"] = round(float(row.total_hours), 2)
 
-    # Include pods that exist as sprints but have no tickets yet
+    # Include pods that exist as sprints but have no tickets yet (skip empty names)
     sprint_pods = db.query(Sprint.pod).filter(
         Sprint.org_id == user.org_id,
     ).distinct().all()
     for (spod,) in sprint_pods:
-        p = spod or ""
-        if p not in pods:
+        p = (spod or "").strip()
+        if p and p not in pods:
             pods[p] = {"pod": p, "statuses": {}, "total_hours": 0}
 
     return list(pods.values())

@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from app.core.database import get_db
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_manager_up
 
 router = APIRouter(prefix="/api/spaces", tags=["spaces"])
 
@@ -409,7 +409,7 @@ async def get_space_epics(
 async def create_space(
     payload: SpaceCreatePayload,
     db: Session = Depends(get_db),
-    user = Depends(get_current_user),
+    user = Depends(get_manager_up),
 ):
     """Create a new space by inserting a planning sprint for the POD."""
     from app.models.sprint import Sprint
@@ -445,7 +445,7 @@ async def create_space(
 async def delete_space(
     pod: str,
     db: Session = Depends(get_db),
-    user = Depends(get_current_user),
+    user = Depends(get_manager_up),
 ):
     """Delete a space and all associated data."""
     from app.models.ticket import JiraTicket, Worklog

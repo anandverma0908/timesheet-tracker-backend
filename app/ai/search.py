@@ -20,7 +20,7 @@ async def semantic_search(query: str, org_id: str, limit: int = 10) -> list[dict
     db = SessionLocal()
     try:
         tickets = db.execute(text("""
-            SELECT 'ticket' as source_type, t.jira_key as key, t.summary as title,
+            SELECT t.id::text as id, 'ticket' as source_type, t.jira_key as key, t.summary as title,
                    te.content_snippet as snippet,
                    1 - (te.embedding <=> CAST(:emb AS vector)) as similarity
             FROM ticket_embeddings te
@@ -31,7 +31,7 @@ async def semantic_search(query: str, org_id: str, limit: int = 10) -> list[dict
 
         try:
             wiki = db.execute(text("""
-                SELECT 'wiki' as source_type, wp.id::text as key, wp.title,
+                SELECT wp.id::text as id, 'wiki' as source_type, wp.id::text as key, wp.title,
                        we.content_snippet as snippet,
                        1 - (we.embedding <=> CAST(:emb AS vector)) as similarity
                 FROM wiki_embeddings we

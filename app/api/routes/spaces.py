@@ -2,9 +2,15 @@
 app/api/routes/spaces.py — Project/Space detail aggregation for the Spaces feature.
 
 Endpoints:
-  GET /api/spaces/{pod}/project   Full project payload (matches frontend Project type)
-  GET /api/spaces/{pod}/backlog   Tickets in this pod not assigned to any sprint
-  GET /api/spaces/{pod}/epics     Epics for this pod
+  GET /api/spaces                  List all spaces with health scores
+  GET /api/spaces/{pod}/project    Full project payload (matches frontend Project type)
+  GET /api/spaces/{pod}/health     Unified health score + radar + risk flags
+  GET /api/spaces/anomalies        Rule-based anomaly detection across all pods
+  GET /api/spaces/dependencies     Cross-space blocker dependency map
+  GET /api/spaces/{pod}/backlog    Tickets in this pod not assigned to any sprint
+  GET /api/spaces/{pod}/epics      Epics for this pod
+  POST /api/spaces                 Create a new space
+  DELETE /api/spaces/{pod}         Delete a space and all its data
 """
 
 from datetime import date, timedelta
@@ -112,6 +118,251 @@ def _normalize_type(t: Optional[str]) -> str:
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────
+
+@router.get("")
+async def list_spaces(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    List all spaces (pods) for the org with summary stats and unified health scores.
+    Used by SpacesPage to populate the grid/list/heatmap views.
+    """
+    from app.models.ticket import JiraTicket, Worklog
+    from app.models.sprint import Sprint
+    from app.services.health_service import compute_health
+
+    org_id = user.org_id
+
+    # All distinct pods from tickets + sprints
+    ticket_pods = db.query(JiraTicket.pod).filter(
+        JiraTicket.org_id == org_id,
+        JiraTicket.is_deleted == False,
+        JiraTicket.pod != None,
+    ).distinct().all()
+
+    sprint_pods = db.query(Sprint.pod).filter(
+        Sprint.org_id == org_id,
+        Sprint.pod != None,
+    ).distinct().all()
+
+    all_pods = sorted({p for (p,) in ticket_pods + sprint_pods if (p or "").strip()})
+
+    result = []
+    for pod in all_pods:
+        tickets = db.query(JiraTicket).filter(
+            JiraTicket.org_id == org_id,
+            JiraTicket.pod == pod,
+            JiraTicket.is_deleted == False,
+        ).all()
+
+        active_sprint = db.query(Sprint).filter(
+            Sprint.org_id == org_id,
+            Sprint.pod == pod,
+            Sprint.status == "active",
+        ).first()
+
+        health = compute_health(tickets, active_sprint)
+
+        # Ticket counts
+        done_keys     = {"done", "closed", "resolved"}
+        n_done        = sum(1 for t in tickets if (t.status or "").lower() in done_keys)
+        n_blocked     = sum(1 for t in tickets if (t.status or "").lower() == "blocked")
+        n_in_progress = sum(1 for t in tickets if "progress" in (t.status or "").lower())
+
+        total_hours_row = db.query(func.sum(Worklog.hours)).join(
+            JiraTicket, JiraTicket.id == Worklog.ticket_id
+        ).filter(
+            JiraTicket.org_id == org_id,
+            JiraTicket.pod == pod,
+            JiraTicket.is_deleted == False,
+        ).scalar() or 0
+
+        result.append({
+            "pod":                  pod,
+            "color":                POD_COLORS.get(pod, "#8B8FA8"),
+            "total_tickets":        len(tickets),
+            "completed_tickets":    n_done,
+            "in_progress_tickets":  n_in_progress,
+            "blocked_tickets":      n_blocked,
+            "total_hours":          round(float(total_hours_row), 2),
+            "has_active_sprint":    active_sprint is not None,
+            "sprint_name":          active_sprint.name if active_sprint else None,
+            **health,  # health_score, radar, delivery_confidence, sprint_prediction, trend, risk_flags
+        })
+
+    return result
+
+
+@router.get("/anomalies")
+async def get_anomalies(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    Rule-based anomaly detection across all pods.
+    Powers EOSIntelligencePanel → Anomalies tab.
+    No LLM needed — deterministic rules over health metrics.
+    """
+    from app.models.ticket import JiraTicket
+    from app.models.sprint import Sprint
+    from app.services.health_service import compute_health, detect_anomalies
+
+    org_id = user.org_id
+
+    pods = db.query(JiraTicket.pod).filter(
+        JiraTicket.org_id == org_id,
+        JiraTicket.is_deleted == False,
+        JiraTicket.pod != None,
+    ).distinct().all()
+
+    all_anomalies = []
+    for (pod,) in pods:
+        if not (pod or "").strip():
+            continue
+        tickets = db.query(JiraTicket).filter(
+            JiraTicket.org_id == org_id,
+            JiraTicket.pod == pod,
+            JiraTicket.is_deleted == False,
+        ).all()
+        active_sprint = db.query(Sprint).filter(
+            Sprint.org_id == org_id,
+            Sprint.pod == pod,
+            Sprint.status == "active",
+        ).first()
+        health = compute_health(tickets, active_sprint)
+        all_anomalies.extend(detect_anomalies(pod, health))
+
+    # Sort by severity (high first)
+    severity_order = {"high": 0, "medium": 1, "low": 2}
+    all_anomalies.sort(key=lambda a: severity_order.get(a["severity"], 9))
+    return all_anomalies
+
+
+@router.get("/dependencies")
+async def get_dependencies(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    Cross-space dependency map: blocked tickets that affect other pods.
+    Powers EOSIntelligencePanel → Deps tab.
+
+    Strategy: find Blocked tickets, then look for tickets in OTHER pods
+    that reference the same client/epic/sprint context (same sprint = shared dependency).
+    """
+    from app.models.ticket import JiraTicket
+    from app.models.sprint import Sprint
+
+    org_id = user.org_id
+
+    blocked_tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id == org_id,
+        JiraTicket.is_deleted == False,
+        JiraTicket.status.ilike("blocked"),
+    ).all()
+
+    deps = []
+    seen = set()
+
+    for bt in blocked_tickets:
+        if not bt.pod:
+            continue
+
+        # Find pods sharing the same sprint (cross-pod sprint = dependency)
+        if bt.sprint_id:
+            sprint_mates = db.query(JiraTicket.pod).filter(
+                JiraTicket.sprint_id == bt.sprint_id,
+                JiraTicket.org_id == org_id,
+                JiraTicket.pod != bt.pod,
+                JiraTicket.is_deleted == False,
+                JiraTicket.pod != None,
+            ).distinct().all()
+
+            for (dep_pod,) in sprint_mates:
+                key = (bt.pod, dep_pod, bt.jira_key)
+                if key not in seen:
+                    seen.add(key)
+                    deps.append({
+                        "from_pod":           bt.pod,
+                        "to_pod":             dep_pod,
+                        "blocker_ticket_key": bt.jira_key,
+                        "blocker_summary":    (bt.summary or "")[:80],
+                        "impact_score":       _blocker_impact(bt),
+                    })
+
+        # Find pods sharing the same client (same client delivery = dependency)
+        if bt.client:
+            client_pods = db.query(JiraTicket.pod).filter(
+                JiraTicket.org_id == org_id,
+                JiraTicket.client == bt.client,
+                JiraTicket.pod != bt.pod,
+                JiraTicket.is_deleted == False,
+                JiraTicket.pod != None,
+            ).distinct().all()
+
+            for (dep_pod,) in client_pods[:3]:  # cap at 3 per ticket
+                key = (bt.pod, dep_pod, bt.jira_key)
+                if key not in seen:
+                    seen.add(key)
+                    deps.append({
+                        "from_pod":           bt.pod,
+                        "to_pod":             dep_pod,
+                        "blocker_ticket_key": bt.jira_key,
+                        "blocker_summary":    (bt.summary or "")[:80],
+                        "impact_score":       _blocker_impact(bt),
+                    })
+
+    deps.sort(key=lambda d: d["impact_score"], reverse=True)
+    return deps
+
+
+def _blocker_impact(ticket) -> int:
+    """Simple impact score for a blocker ticket (0-100)."""
+    score = 50
+    p = (ticket.priority or "").lower()
+    if p in ("critical", "blocker", "highest"): score += 40
+    elif p == "high":                           score += 20
+    elif p in ("low", "lowest", "trivial"):     score -= 20
+    if ticket.story_points and ticket.story_points >= 5: score += 10
+    return min(100, max(0, score))
+
+
+@router.get("/{pod}/health")
+async def get_space_health(
+    pod: str,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    Unified health score for a single pod.
+    Used by BOTH the Spaces list card and SummaryTab radar chart
+    so they always show the same numbers.
+    """
+    from app.models.ticket import JiraTicket
+    from app.models.sprint import Sprint
+    from app.services.health_service import compute_health
+
+    org_id = user.org_id
+
+    tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id == org_id,
+        JiraTicket.pod == pod,
+        JiraTicket.is_deleted == False,
+    ).all()
+
+    active_sprint = db.query(Sprint).filter(
+        Sprint.org_id == org_id,
+        Sprint.pod == pod,
+        Sprint.status == "active",
+    ).first()
+
+    if not tickets and not active_sprint:
+        from fastapi import HTTPException
+        raise HTTPException(404, f"No data found for pod '{pod}'")
+
+    return compute_health(tickets, active_sprint)
+
 
 @router.get("/{pod}/project")
 async def get_space_project(

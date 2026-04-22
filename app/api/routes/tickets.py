@@ -250,6 +250,7 @@ async def list_tickets(
     pod:        Optional[str] = Query(None),
     status:     Optional[str] = Query(None),
     assignee:   Optional[str] = Query(None),
+    user_filter: Optional[str] = Query(None, alias="user"),  # alias for assignee
     client:     Optional[str] = Query(None),
     issue_type: Optional[str] = Query(None),
     search:     Optional[str] = Query(None),
@@ -258,16 +259,17 @@ async def list_tickets(
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ):
+    effective_assignee = assignee or user_filter
     q = db.query(JiraTicket).filter(
         JiraTicket.org_id == user.org_id,
         JiraTicket.is_deleted == False,
     )
-    if pod:        q = q.filter(JiraTicket.pod == pod)
-    if status:     q = q.filter(JiraTicket.status == status)
-    if assignee:   q = q.filter(JiraTicket.assignee.ilike(f"%{assignee}%"))
-    if client:     q = q.filter(JiraTicket.client == client)
-    if issue_type: q = q.filter(JiraTicket.issue_type == issue_type)
-    if search:     q = q.filter(JiraTicket.summary.ilike(f"%{search}%"))
+    if pod:                q = q.filter(JiraTicket.pod == pod)
+    if status:             q = q.filter(JiraTicket.status == status)
+    if effective_assignee: q = q.filter(JiraTicket.assignee.ilike(f"%{effective_assignee}%"))
+    if client:             q = q.filter(JiraTicket.client == client)
+    if issue_type:         q = q.filter(JiraTicket.issue_type == issue_type)
+    if search:             q = q.filter(JiraTicket.summary.ilike(f"%{search}%"))
 
     total   = q.count()
     tickets = q.order_by(JiraTicket.synced_at.desc()).offset(offset).limit(limit).all()

@@ -27,12 +27,21 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_hours: int = 24
 
-    # ── NOVA / Ollama ─────────────────────────────────────────────────────────
+    # ── NOVA Provider ────────────────────────────────────────────────────────
+    # NOVA_PROVIDER=cerebras  → fast cloud inference (free tier)
+    # NOVA_PROVIDER=ollama    → local Ollama (default)
+    nova_provider: str = "ollama"
+
+    # ── Ollama (local) ───────────────────────────────────────────────────────
     nova_model: str = "llama3.1:8b"
     nova_base_url: str = "http://ollama:11434"
     nova_temperature: float = 0.3
     nova_max_tokens: int = 1500
     embedding_model: str = "all-MiniLM-L6-v2"
+
+    # ── Cerebras (cloud) ─────────────────────────────────────────────────────
+    cerebras_api_key: str = ""
+    cerebras_model: str = "llama3.1-8b"
 
     # ── File uploads ──────────────────────────────────────────────────────────
     upload_dir: str = "uploads"

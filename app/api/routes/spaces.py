@@ -475,7 +475,7 @@ async def get_space_project(
                     "assigneeInitials": _initials(t.assignee),
                     "assigneeColor": _hash_color(t.assignee or str(idx)),
                     "storyPoints": t.story_points or 0,
-                    "dueDate": t.jira_updated.isoformat() if t.jira_updated else None,
+                    "dueDate": t.due_date.isoformat() if t.due_date else None,
                     "createdAt": t.jira_created.isoformat() if t.jira_created else "",
                     "updatedAt": t.jira_updated.isoformat() if t.jira_updated else "",
                     "description": t.description or f"{t.summary} — detailed description.",
@@ -620,7 +620,7 @@ async def get_space_backlog(
             "assigneeInitials": _initials(t.assignee),
             "assigneeColor": _hash_color(t.assignee or str(idx)),
             "storyPoints": t.story_points or 0,
-            "dueDate": t.jira_updated.isoformat() if t.jira_updated else None,
+            "dueDate": t.due_date.isoformat() if t.due_date else None,
             "createdAt": t.jira_created.isoformat() if t.jira_created else "",
             "updatedAt": t.jira_updated.isoformat() if t.jira_updated else "",
         }

@@ -205,6 +205,21 @@ async def ai_analyze(
     )
 
 
+@router.get("/{ticket_key}/code-context")
+async def get_code_context(
+    ticket_key: str,
+    title: str = Query(""),
+    description: str = Query(""),
+    user: User = Depends(get_current_user),
+):
+    """AI generates search terms, then searches all configured GitHub repos for relevant files and PRs."""
+    from app.services.github import search_all_repos, is_configured
+    if not is_configured():
+        return {"connected": False, "files": [], "prs": []}
+    result = await search_all_repos(ticket_key=ticket_key, title=title, description=description)
+    return {"connected": True, **result}
+
+
 @router.post("", response_model=TicketOut, status_code=201)
 async def create_ticket(
     body: TicketCreate,

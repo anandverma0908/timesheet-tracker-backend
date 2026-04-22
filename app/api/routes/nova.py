@@ -1142,3 +1142,100 @@ async def trigger_gap_detection(
 
     gaps = await detect_knowledge_gaps(user.org_id, db)
     return {"detected": len(gaps), "gaps": gaps}
+
+
+@router.post("/goals-insight")
+async def goals_insight(
+    body: dict,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    """Generate a NOVA AI insight for a specific goal based on linked tickets and sprint context."""
+    from app.ai.nova import chat
+    from app.models.goal import Goal
+    from app.models.ticket import JiraTicket
+    from app.models.sprint import Sprint
+
+    goal_id = body.get("goal_id")
+    if not goal_id:
+        raise HTTPException(400, "goal_id is required")
+
+    goal = db.query(Goal).filter(
+        Goal.id == goal_id,
+        Goal.org_id == user.org_id,
+    ).first()
+    if not goal:
+        raise HTTPException(404, "Goal not found")
+
+    # Gather linked ticket context
+    kr_titles = []
+    all_linked_keys = set()
+    for kr in (goal.key_results or []):
+        kr_titles.append(kr.get("title", ""))
+        all_linked_keys.update(kr.get("linked_tickets", []))
+
+    tickets_ctx = ""
+    if all_linked_keys:
+        tickets = db.query(JiraTicket).filter(
+            JiraTicket.jira_key.in_(list(all_linked_keys)),
+            JiraTicket.org_id == user.org_id,
+            JiraTicket.is_deleted == False,
+        ).all()
+        ticket_lines = []
+        for t in tickets:
+            line = f"- {t.jira_key} | {t.status} | {t.priority or 'Medium'} | {(t.summary or '')[:60]}"
+            ticket_lines.append(line)
+        tickets_ctx = "\n".join(ticket_lines) or "No linked tickets found."
+    else:
+        tickets_ctx = "No linked tickets."
+
+    # Sprint context
+    sprint_ctx = ""
+    if goal.linked_sprints:
+        sprints = db.query(Sprint).filter(
+            Sprint.name.in_(goal.linked_sprints),
+            Sprint.org_id == user.org_id,
+        ).all()
+        if sprints:
+            sp = sprints[0]
+            sprint_ctx = f"Linked sprint: {sp.name} ({sp.status})."
+
+    prompt = f"""Goal: {goal.title}
+Description: {goal.description or 'N/A'}
+Status: {goal.status}
+Progress: {goal.overall_progress}%
+
+Key Results:
+"""
+    for kr in (goal.key_results or []):
+        prompt += f"- {kr.get('title', '')}: {kr.get('current', 0)}/{kr.get('target', 1)} {kr.get('unit', '')} ({kr.get('status', 'on_track')})\n"
+
+    prompt += f"""
+Linked Tickets:
+{tickets_ctx}
+
+{sprint_ctx}
+
+Write a concise, actionable AI insight (2-3 sentences) for this OKR.
+Be specific about risks, blockers, or next steps.
+If the goal is on track, say so and mention what completes it.
+If at risk or behind, flag the critical path and suggest one concrete action."""
+
+    try:
+        insight = await chat(
+            user_message=prompt,
+            temperature=0.4,
+            max_tokens=200,
+        )
+    except Exception:
+        # Fallback insight
+        if goal.status == "on_track":
+            insight = f"{goal.title} is progressing well at {goal.overall_progress}%. Continue current momentum to close remaining key results."
+        elif goal.status == "complete":
+            insight = f"{goal.title} has been achieved. Document learnings and celebrate the win with the team."
+        elif goal.status == "at_risk":
+            insight = f"{goal.title} is at risk at {goal.overall_progress}%. Review blocked linked tickets and consider reallocating capacity."
+        else:
+            insight = f"{goal.title} is behind at {goal.overall_progress}%. Immediate scope reduction or additional resources are recommended."
+
+    return {"insight": insight}

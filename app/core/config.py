@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     upload_dir: str = "uploads"
     max_upload_bytes: int = 10 * 1024 * 1024  # 10 MB
 
+    # ── GitHub integration ────────────────────────────────────────────────────
+    github_token: str = ""          # Personal Access Token with repo scope
+    github_repos: str = ""          # Comma-separated list: "org/repo1,org/repo2,org/repo3"
+
     # ── Jira sync ─────────────────────────────────────────────────────────────
     sync_interval_minutes: int = 30
 

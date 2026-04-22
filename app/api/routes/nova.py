@@ -18,6 +18,7 @@ Endpoints:
   POST /api/nova/sprint-draft/:pod       AI-drafted sprint backlog for a pod
 """
 
+import hashlib
 from datetime import date
 from typing import Optional
 
@@ -70,6 +71,12 @@ async def nova_status(user: User = Depends(get_current_user)):
 
 import json as _json
 import re  as _re
+
+
+def _compute_data_hash(*parts) -> str:
+    """Deterministic SHA-256 hash of input data for cache invalidation."""
+    payload = "|".join(str(p) for p in parts)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _parse_nova_json(text: Optional[str]):
@@ -815,14 +822,15 @@ async def spaces_brief(
 ):
     """
     EOS Project Brief for a pod's SummaryTab.
-    Returns a short brief paragraph + 3 structured insight signals:
-      velocity_signal, risk_signal, recommendation
+    Returns a short brief paragraph + 3 structured insight signals.
+    Caches result so repeated refreshes are deterministic.
     Falls back gracefully when NOVA is unavailable.
     """
     import asyncio
     from app.ai.nova import chat
     from app.models.ticket import JiraTicket
     from app.models.sprint import Sprint
+    from app.models.space_brief import SpaceBrief
     from app.services.health_service import compute_health
     from datetime import date
 
@@ -862,6 +870,32 @@ async def spaces_brief(
         for t in sorted(tickets, key=lambda t: (t.status or ""), reverse=True)[:10]
     ) or "No tickets."
 
+    # ── Cache key: hash of all deterministic inputs ──
+    data_hash = _compute_data_hash(
+        pod,
+        health["health_score"],
+        health["radar"],
+        len(tickets), done, blocked, overdue,
+        sprint_ctx,
+        ticket_sample,
+    )
+
+    cached = db.query(SpaceBrief).filter(
+        SpaceBrief.org_id == org_id,
+        SpaceBrief.pod == pod,
+    ).first()
+
+    if cached and cached.data_hash == data_hash and cached.brief:
+        return {
+            "pod":             pod,
+            "health_score":    health["health_score"],
+            "brief":           cached.brief,
+            "velocity_signal": cached.velocity_signal or "",
+            "risk_signal":     cached.risk_signal or "",
+            "recommendation":  cached.recommendation or "",
+            "nova_powered":    True,
+        }
+
     prompt = f"""Pod: {pod}
 Health score: {health['health_score']}/100. Radar: {health['radar']}.
 Tickets: {len(tickets)} total, {done} done, {blocked} blocked, {overdue} overdue.
@@ -882,18 +916,28 @@ Then return exactly 3 insight signals in this JSON format — no prose before or
 
     try:
         raw = await asyncio.wait_for(
-            chat(user_message=prompt, temperature=0.3, max_tokens=350),
+            chat(user_message=prompt, temperature=0.0, max_tokens=350),
             timeout=15.0,
         )
         data = _parse_nova_json(raw)
         if isinstance(data, dict) and "brief" in data:
+            # Upsert cache
+            if not cached:
+                cached = SpaceBrief(org_id=org_id, pod=pod)
+                db.add(cached)
+            cached.data_hash = data_hash
+            cached.brief = data.get("brief", "")
+            cached.velocity_signal = data.get("velocity_signal", "")
+            cached.risk_signal = data.get("risk_signal", "")
+            cached.recommendation = data.get("recommendation", "")
+            db.commit()
             return {
                 "pod":              pod,
                 "health_score":     health["health_score"],
-                "brief":            data.get("brief", ""),
-                "velocity_signal":  data.get("velocity_signal", ""),
-                "risk_signal":      data.get("risk_signal", ""),
-                "recommendation":   data.get("recommendation", ""),
+                "brief":            cached.brief,
+                "velocity_signal":  cached.velocity_signal,
+                "risk_signal":      cached.risk_signal,
+                "recommendation":   cached.recommendation,
                 "nova_powered":     True,
             }
     except Exception:
@@ -907,10 +951,21 @@ Then return exactly 3 insight signals in this JSON format — no prose before or
     rc = ("Unblock critical tickets first." if blocked >= 2
           else "Focus on completing in-progress work before pulling new tickets.")
 
+    # Cache fallback too so it doesn't flip-flop between AI and fallback
+    if not cached:
+        cached = SpaceBrief(org_id=org_id, pod=pod)
+        db.add(cached)
+    cached.data_hash = data_hash
+    cached.brief = f"{pod} pod health is {health['health_score']}/100. {done}/{len(tickets)} tickets complete."
+    cached.velocity_signal = vs
+    cached.risk_signal = rs
+    cached.recommendation = rc
+    db.commit()
+
     return {
         "pod":             pod,
         "health_score":    health["health_score"],
-        "brief":           f"{pod} pod health is {health['health_score']}/100. {done}/{len(tickets)} tickets complete.",
+        "brief":           cached.brief,
         "velocity_signal": vs,
         "risk_signal":     rs,
         "recommendation":  rc,
@@ -1150,7 +1205,8 @@ async def goals_insight(
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ):
-    """Generate a NOVA AI insight for a specific goal based on linked tickets and sprint context."""
+    """Generate a NOVA AI insight for a specific goal.
+    Caches result so repeated refreshes are deterministic."""
     from app.ai.nova import chat
     from app.models.goal import Goal
     from app.models.ticket import JiraTicket
@@ -1200,6 +1256,15 @@ async def goals_insight(
             sp = sprints[0]
             sprint_ctx = f"Linked sprint: {sp.name} ({sp.status})."
 
+    # ── Cache check ──
+    data_hash = _compute_data_hash(
+        goal.title, goal.description, goal.status, goal.overall_progress,
+        goal.key_results, goal.linked_sprints,
+        tickets_ctx, sprint_ctx,
+    )
+    if goal.nova_insight and goal.nova_insight_hash == data_hash:
+        return {"insight": goal.nova_insight}
+
     prompt = f"""Goal: {goal.title}
 Description: {goal.description or 'N/A'}
 Status: {goal.status}
@@ -1224,7 +1289,7 @@ If at risk or behind, flag the critical path and suggest one concrete action."""
     try:
         insight = await chat(
             user_message=prompt,
-            temperature=0.4,
+            temperature=0.0,
             max_tokens=200,
         )
     except Exception:
@@ -1237,5 +1302,10 @@ If at risk or behind, flag the critical path and suggest one concrete action."""
             insight = f"{goal.title} is at risk at {goal.overall_progress}%. Review blocked linked tickets and consider reallocating capacity."
         else:
             insight = f"{goal.title} is behind at {goal.overall_progress}%. Immediate scope reduction or additional resources are recommended."
+
+    # Persist cache
+    goal.nova_insight = insight
+    goal.nova_insight_hash = data_hash
+    db.commit()
 
     return {"insight": insight}

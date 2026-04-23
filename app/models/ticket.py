@@ -20,6 +20,7 @@ class JiraTicket(Base):
     description              = Column(Text,        nullable=True)
     assignee                 = Column(String(200), nullable=True)
     assignee_email           = Column(String(200), nullable=True)
+    reporter                 = Column(String(200), nullable=True)
     status                   = Column(String(100), nullable=True)
     client                   = Column(String(200), nullable=True)
     pod                      = Column(String(100), nullable=True)
@@ -125,3 +126,22 @@ class TicketEmbedding(Base):
     __table_args__ = (Index("ix_te_ticket", "ticket_id"),)
 
     # embedding column added back via raw SQL below (pgvector type not in SQLAlchemy by default)
+
+
+class TicketLink(Base):
+    __tablename__ = "ticket_links"
+
+    id               = Column(UUID(as_uuid=False), primary_key=True, default=gen_uuid)
+    org_id           = Column(UUID(as_uuid=False), ForeignKey("organisations.id", ondelete="CASCADE"), nullable=False)
+    source_ticket_id = Column(UUID(as_uuid=False), ForeignKey("jira_tickets.id", ondelete="CASCADE"), nullable=False)
+    target_key       = Column(String(50),  nullable=False)
+    target_summary   = Column(Text,        nullable=True)
+    link_type        = Column(String(100), nullable=False)
+    created_at       = Column(DateTime, default=now)
+
+    source = relationship("JiraTicket", foreign_keys=[source_ticket_id])
+
+    __table_args__ = (
+        UniqueConstraint("source_ticket_id", "target_key", "link_type", name="uq_ticket_link"),
+        Index("ix_tl_source", "source_ticket_id"),
+    )

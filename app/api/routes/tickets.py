@@ -15,6 +15,11 @@ Endpoints:
   DELETE /api/tickets/:id/comments/:cid  Soft-delete comment
   POST   /api/tickets/:id/attachments    Upload attachment
   GET    /api/tickets/:id/attachments    List attachments
+  GET    /api/tickets/:id/worklogs       List worklogs
+  POST   /api/tickets/:id/worklogs       Log time
+  GET    /api/tickets/:id/links          List linked issues
+  POST   /api/tickets/:id/links          Add link
+  DELETE /api/tickets/:id/links/:lid     Remove link
   GET    /api/tickets/:id/activity       Audit log for ticket
 """
 
@@ -28,13 +33,14 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db, SessionLocal
 from app.core.dependencies import get_current_user
 from app.core.config import settings
-from app.models.ticket import JiraTicket, TicketComment, TicketAttachment
+from app.models.ticket import JiraTicket, TicketComment, TicketAttachment, TicketLink
 from app.models.audit import AuditLog
 from app.models.user import User
 from app.schemas.ticket import (
     TicketCreate, TicketUpdate, TicketOut, StatusTransition,
     NLCreateRequest, AIAnalyzeRequest, AIAnalyzeOut,
-    CommentCreate, CommentOut, AttachmentOut,
+    CommentCreate, CommentOut, AttachmentOut, WorklogOut,
+    TicketLinkCreate, TicketLinkOut,
 )
 
 router = APIRouter(prefix="/api/tickets", tags=["tickets"])
@@ -69,8 +75,6 @@ def _write_audit(db: Session, entity_id: str, org_id: str, user_id: str, action:
 
 def _resolve_ticket(db: Session, org_id: str, ticket_id: str) -> Optional[JiraTicket]:
     """Look up by UUID id first, then fallback to jira_key."""
-    # Only query by id if ticket_id looks like a UUID; otherwise PG throws a DataError
-    # trying to cast a jira key (e.g. 'SNOP-147') to the UUID column type.
     try:
         uuid.UUID(ticket_id)
     except ValueError:
@@ -89,6 +93,11 @@ def _resolve_ticket(db: Session, org_id: str, ticket_id: str) -> Optional[JiraTi
         JiraTicket.org_id == org_id,
         JiraTicket.is_deleted == False,
     ).first()
+
+
+def _attachment_url(filepath: str) -> str:
+    filename = os.path.basename(filepath)
+    return f"/uploads/{filename}"
 
 
 def _to_out(t: JiraTicket) -> dict:
@@ -110,6 +119,7 @@ def _to_out(t: JiraTicket) -> dict:
         "client":         t.client,
         "assignee":       t.assignee,
         "assignee_email": t.assignee_email,
+        "reporter":       t.reporter,
         "story_points":   t.story_points,
         "labels":         t.labels or [],
         "sprint_id":      t.sprint_id,
@@ -151,7 +161,6 @@ async def nl_create_ticket(
     analysis = await full_analysis(body.text, user.org_id)
     fields   = analysis.get("fields", {})
 
-    # If NOVA is offline, fall back to raw text as title rather than rejecting
     if "error" in fields:
         fields = {"title": body.text[:100]}
 
@@ -170,6 +179,7 @@ async def nl_create_ticket(
         pod=fields.get("pod"),
         client=fields.get("client"),
         assignee=fields.get("assignee"),
+        reporter=user.name,
         story_points=fields.get("story_points"),
         labels=fields.get("labels") or [],
         is_deleted=False,
@@ -243,6 +253,7 @@ async def create_ticket(
         client=body.client,
         assignee=body.assignee,
         assignee_email=body.assignee_email,
+        reporter=body.reporter or user.name,
         story_points=body.story_points,
         labels=body.labels or [],
         sprint_id=body.sprint_id,
@@ -265,7 +276,7 @@ async def list_tickets(
     pod:        Optional[str] = Query(None),
     status:     Optional[str] = Query(None),
     assignee:   Optional[str] = Query(None),
-    user_filter: Optional[str] = Query(None, alias="user"),  # alias for assignee
+    user_filter: Optional[str] = Query(None, alias="user"),
     client:     Optional[str] = Query(None),
     issue_type: Optional[str] = Query(None),
     search:     Optional[str] = Query(None),
@@ -324,8 +335,12 @@ async def update_ticket(
 
     diff = {}
     for field, value in body.model_dump(exclude_none=True).items():
-        if getattr(ticket, field, None) != value:
-            diff[field] = {"old": getattr(ticket, field, None), "new": value}
+        old_val = getattr(ticket, field, None)
+        # For date fields, compare as strings to avoid type mismatch
+        old_cmp = old_val.isoformat() if hasattr(old_val, "isoformat") else old_val
+        new_cmp = value.isoformat() if hasattr(value, "isoformat") else value
+        if old_cmp != new_cmp:
+            diff[field] = {"old": old_cmp, "new": new_cmp}
             setattr(ticket, field, value)
 
     if diff:
@@ -454,6 +469,39 @@ async def add_comment(
         parent_id=body.parent_id,
     )
     db.add(comment)
+    _write_audit(db, ticket.id, user.org_id, user.id, "commented", {"body": body.body[:100]})
+    db.commit()
+    db.refresh(comment)
+    return CommentOut(
+        id=comment.id, ticket_id=comment.ticket_id, author_id=comment.author_id,
+        body=comment.body, parent_id=comment.parent_id,
+        created_at=comment.created_at, updated_at=comment.updated_at,
+        is_deleted=comment.is_deleted, author_name=user.name,
+    )
+
+
+@router.put("/{ticket_id}/comments/{comment_id}", response_model=CommentOut)
+async def edit_comment(
+    ticket_id:  str,
+    comment_id: str,
+    body: CommentCreate,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
+    comment = db.query(TicketComment).filter(
+        TicketComment.id == comment_id,
+        TicketComment.ticket_id == ticket.id,
+        TicketComment.is_deleted == False,
+    ).first()
+    if not comment:
+        raise HTTPException(404, "Comment not found")
+    if comment.author_id != user.id and user.role != "admin":
+        raise HTTPException(403, "Not allowed to edit this comment")
+    comment.body = body.body
     db.commit()
     db.refresh(comment)
     return CommentOut(
@@ -471,9 +519,14 @@ async def delete_comment(
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ):
+    # Resolve ticket by jira_key or UUID to get the actual UUID primary key
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
     comment = db.query(TicketComment).filter(
         TicketComment.id == comment_id,
-        TicketComment.ticket_id == ticket_id,
+        TicketComment.ticket_id == ticket.id,
         TicketComment.is_deleted == False,
     ).first()
     if not comment:
@@ -481,6 +534,7 @@ async def delete_comment(
     if comment.author_id != user.id and user.role != "admin":
         raise HTTPException(403, "Not allowed to delete this comment")
     comment.is_deleted = True
+    _write_audit(db, ticket.id, user.org_id, user.id, "deleted comment", {})
     db.commit()
 
 
@@ -518,9 +572,13 @@ async def upload_attachment(
         uploaded_by=user.id,
     )
     db.add(attachment)
+    _write_audit(db, ticket.id, user.org_id, user.id, "attached file", {"filename": file.filename})
     db.commit()
     db.refresh(attachment)
-    return AttachmentOut.model_validate(attachment)
+
+    out = AttachmentOut.model_validate(attachment)
+    out.url = _attachment_url(attachment.filepath)
+    return out
 
 
 @router.get("/{ticket_id}/attachments", response_model=List[AttachmentOut])
@@ -536,10 +594,44 @@ async def list_attachments(
     attachments = db.query(TicketAttachment).filter(
         TicketAttachment.ticket_id == ticket.id
     ).order_by(TicketAttachment.created_at).all()
-    return [AttachmentOut.model_validate(a) for a in attachments]
+
+    result = []
+    for a in attachments:
+        out = AttachmentOut.model_validate(a)
+        out.url = _attachment_url(a.filepath)
+        result.append(out)
+    return result
 
 
 # ── WORKLOGS ─────────────────────────────────────────────────────────────────
+
+@router.get("/{ticket_id}/worklogs", response_model=List[dict])
+async def list_worklogs(
+    ticket_id: str,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    from app.models.ticket import Worklog
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
+    worklogs = db.query(Worklog).filter(
+        Worklog.ticket_id == ticket.id
+    ).order_by(Worklog.log_date.desc()).all()
+
+    return [
+        {
+            "id":           wl.id,
+            "author":       wl.author,
+            "author_email": wl.author_email,
+            "log_date":     wl.log_date.isoformat() if wl.log_date else None,
+            "hours":        wl.hours,
+            "comment":      wl.comment,
+        }
+        for wl in worklogs
+    ]
+
 
 @router.post("/{ticket_id}/worklogs", status_code=201)
 async def log_time(
@@ -578,9 +670,10 @@ async def log_time(
         comment=comment,
     )
     db.add(worklog)
-
-    # Update cached hours_spent on ticket
     ticket.hours_spent = (ticket.hours_spent or 0) + hours
+    _write_audit(db, ticket.id, user.org_id, user.id, "logged time", {
+        "hours": hours, "date": log_date_str, "comment": comment
+    })
     db.commit()
     db.refresh(worklog)
 
@@ -592,6 +685,102 @@ async def log_time(
         "log_date": worklog.log_date.isoformat() if worklog.log_date else None,
         "author":   worklog.author,
     }
+
+
+# ── TICKET LINKS ──────────────────────────────────────────────────────────────
+
+@router.get("/{ticket_id}/links", response_model=List[TicketLinkOut])
+async def list_links(
+    ticket_id: str,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
+    links = db.query(TicketLink).filter(
+        TicketLink.source_ticket_id == ticket.id
+    ).order_by(TicketLink.created_at).all()
+
+    return [
+        TicketLinkOut(
+            id=lnk.id,
+            source_ticket_id=lnk.source_ticket_id,
+            target_key=lnk.target_key,
+            target_summary=lnk.target_summary,
+            link_type=lnk.link_type,
+            created_at=lnk.created_at,
+        )
+        for lnk in links
+    ]
+
+
+@router.post("/{ticket_id}/links", response_model=TicketLinkOut, status_code=201)
+async def add_link(
+    ticket_id: str,
+    body: TicketLinkCreate,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    from app.models.base import gen_uuid
+
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
+    # Try to fetch the target ticket's summary for display
+    target_key = body.target_key.strip().upper()
+    target = db.query(JiraTicket).filter(
+        JiraTicket.jira_key == target_key,
+        JiraTicket.org_id == user.org_id,
+        JiraTicket.is_deleted == False,
+    ).first()
+
+    link = TicketLink(
+        id=gen_uuid(),
+        org_id=user.org_id,
+        source_ticket_id=ticket.id,
+        target_key=target_key,
+        target_summary=target.summary if target else None,
+        link_type=body.link_type,
+    )
+    db.add(link)
+    _write_audit(db, ticket.id, user.org_id, user.id, "linked", {
+        "link_type": body.link_type, "target": target_key
+    })
+    db.commit()
+    db.refresh(link)
+
+    return TicketLinkOut(
+        id=link.id,
+        source_ticket_id=link.source_ticket_id,
+        target_key=link.target_key,
+        target_summary=link.target_summary,
+        link_type=link.link_type,
+        created_at=link.created_at,
+    )
+
+
+@router.delete("/{ticket_id}/links/{link_id}", status_code=204)
+async def remove_link(
+    ticket_id: str,
+    link_id:   str,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
+    link = db.query(TicketLink).filter(
+        TicketLink.id == link_id,
+        TicketLink.source_ticket_id == ticket.id,
+    ).first()
+    if not link:
+        raise HTTPException(404, "Link not found")
+    db.delete(link)
+    db.commit()
 
 
 # ── ACTIVITY LOG ──────────────────────────────────────────────────────────────

@@ -74,8 +74,10 @@ class WikiVersionOut(BaseModel):
 
 
 class MeetingNotesRequest(BaseModel):
-    notes: str
+    notes: Optional[str] = None
+    content: Optional[str] = None
 
 
 class MeetingNotesOut(BaseModel):
     action_items: List[dict]
+    structured_md: Optional[str] = None

@@ -50,6 +50,8 @@ class Settings(BaseSettings):
     # ── GitHub integration ────────────────────────────────────────────────────
     github_token: str = ""          # Personal Access Token with repo scope
     github_repos: str = ""          # Comma-separated list: "org/repo1,org/repo2,org/repo3"
+    code_context_local_repos: str = ""      # Semicolon-separated: "name|/abs/path|org/repo;..."
+    code_context_repo_search_roots: str = ""  # Semicolon-separated roots to scan for local git repos
 
     # ── Jira sync ─────────────────────────────────────────────────────────────
     sync_interval_minutes: int = 30

@@ -18,6 +18,8 @@ Endpoints:
 """
 
 import json
+import re
+from datetime import datetime, timezone
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
@@ -64,6 +66,159 @@ async def _embed_wiki_bg(page_id: str, title: str, content_md: str):
         db.close()
     except Exception as e:
         logging.getLogger(__name__).warning(f"Wiki embed failed for {page_id}: {e}")
+
+
+_TICKET_KEY_RE = re.compile(r"\b[A-Z][A-Z0-9]+-\d+\b")
+_SECRET_PATTERNS = [
+    re.compile(r"ghp_[A-Za-z0-9]{20,}"),
+    re.compile(r"AIza[0-9A-Za-z\-_]{20,}"),
+    re.compile(r"sk-[A-Za-z0-9]{20,}"),
+    re.compile(r"-----BEGIN (?:RSA|EC|OPENSSH|PRIVATE KEY)-----"),
+]
+
+
+def _page_text(page: WikiPage) -> str:
+    return (page.content_md or page.content_html or "").strip()
+
+
+def _freshness_metrics(page: WikiPage) -> tuple[int, str, int]:
+    updated = page.updated_at
+    if not updated:
+        return 999, "stale", 15
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    days_old = max(0, (now - updated.replace(tzinfo=None)).days)
+    if days_old <= 30:
+        return days_old, "fresh", max(65, 100 - days_old)
+    if days_old <= 75:
+        return days_old, "aging", max(40, 82 - (days_old - 30))
+    return days_old, "stale", max(15, 52 - (days_old - 75))
+
+
+def _coverage_metrics(text: str) -> dict:
+    headings = len(re.findall(r"^\s{0,3}#{1,6}\s+\S+", text, re.MULTILINE))
+    examples = len(re.findall(r"```|^\s*[-*]\s|^\s*\d+\.\s", text, re.MULTILINE))
+    links = len(re.findall(r"\[.+?\]\(.+?\)|https?://\S+", text))
+    diagrams = len(re.findall(r"```(?:mermaid|graphviz)|!\[.*?\]\(.+?\)", text, re.IGNORECASE))
+
+    heading_pct = min(100, 25 + headings * 18) if text else 0
+    examples_pct = min(100, examples * 20)
+    links_pct = min(100, links * 18)
+    diagrams_pct = min(100, diagrams * 34)
+
+    return {
+        "headings": heading_pct,
+        "examples": examples_pct,
+        "links": links_pct,
+        "diagrams": diagrams_pct,
+    }
+
+
+def _compliance_metrics(text: str) -> dict:
+    matches = []
+    for pattern in _SECRET_PATTERNS:
+        hit = pattern.search(text)
+        if hit:
+            matches.append(hit.group(0)[:16])
+    return {
+        "passed": len(matches) == 0,
+        "matches": matches[:3],
+    }
+
+
+def _page_health_from_related(page: WikiPage, related_rows: list[dict]) -> dict:
+    text = _page_text(page)
+    days_old, freshness, freshness_score = _freshness_metrics(page)
+    coverage = _coverage_metrics(text)
+    linked_tickets = len(set(_TICKET_KEY_RE.findall(text)))
+    related_count = len(related_rows)
+    best_similarity = max((float(r.get("similarity", 0) or 0) for r in related_rows), default=0.0)
+    has_conflict = best_similarity > 0.9 and len(re.findall(r"\b\d+\s*(?:min|mins|minutes|hours|days)\b", text, re.IGNORECASE)) > 0
+
+    score = round(
+        freshness_score * 0.4
+        + coverage["headings"] * 0.15
+        + coverage["examples"] * 0.15
+        + coverage["links"] * 0.15
+        + coverage["diagrams"] * 0.1
+        + min(100, related_count * 18) * 0.05
+    )
+    score = max(15, min(100, score))
+
+    return {
+        "days_old": days_old,
+        "freshness": freshness,
+        "score": score,
+        "linked_tickets": linked_tickets,
+        "related_count": related_count,
+        "has_conflict": has_conflict,
+        "coverage": coverage,
+        "compliance": _compliance_metrics(text),
+        "word_count": len(text.split()),
+    }
+
+
+def _related_pages_for(db: Session, page_id: str, org_id: str, limit: int = 5) -> list[dict]:
+    try:
+        rows = db.execute(text("""
+            SELECT wp.id, wp.title, wp.space_id,
+                   1 - (we.embedding <=> (
+                       SELECT embedding FROM wiki_embeddings WHERE page_id = :pid
+                   )) AS similarity
+            FROM wiki_embeddings we
+            JOIN wiki_pages wp ON we.page_id = wp.id
+            WHERE wp.org_id  = :org_id
+              AND wp.id      != :pid
+              AND wp.is_deleted = false
+            ORDER BY similarity DESC
+            LIMIT :limit
+        """), {"pid": page_id, "org_id": org_id, "limit": limit}).fetchall()
+        return [dict(r._mapping) for r in rows]
+    except Exception:
+        return []
+
+
+def _space_health(space: WikiSpace, pages: list[WikiPage], related_by_page: dict[str, list[dict]]) -> dict:
+    if not pages:
+        return {
+            "space_id": space.id,
+            "health": 25,
+            "page_count": 0,
+            "fresh_count": 0,
+            "aging_count": 0,
+            "stale_count": 0,
+        }
+
+    page_metrics = [_page_health_from_related(page, related_by_page.get(page.id, [])) for page in pages]
+    avg_score = round(sum(m["score"] for m in page_metrics) / len(page_metrics))
+    return {
+        "space_id": space.id,
+        "health": avg_score,
+        "page_count": len(pages),
+        "fresh_count": sum(1 for m in page_metrics if m["freshness"] == "fresh"),
+        "aging_count": sum(1 for m in page_metrics if m["freshness"] == "aging"),
+        "stale_count": sum(1 for m in page_metrics if m["freshness"] == "stale"),
+    }
+
+
+def _onboarding_path(pages: list[WikiPage], related_by_page: dict[str, list[dict]]) -> list[dict]:
+    ranked = []
+    tags = ["Start here", "Core concepts", "Architecture", "Reference", "Advanced"]
+    for page in pages:
+        metrics = _page_health_from_related(page, related_by_page.get(page.id, []))
+        rank = metrics["score"] + (12 if not page.parent_id else 0) + min(10, metrics["related_count"] * 2)
+        ranked.append((rank, page, metrics))
+    ranked.sort(key=lambda row: row[0], reverse=True)
+    path = []
+    for idx, (_, page, metrics) in enumerate(ranked[:5]):
+        path.append({
+            "page_id": page.id,
+            "title": page.title,
+            "minutes": max(8, min(30, 8 + metrics["word_count"] // 180)),
+            "tag": tags[idx] if idx < len(tags) else "Reference",
+            "freshness": metrics["freshness"],
+            "score": metrics["score"],
+        })
+    return path
 
 
 # ── SPACES ────────────────────────────────────────────────────────────────────
@@ -329,23 +484,152 @@ async def related_pages(
     if not page:
         raise HTTPException(404, "Page not found")
 
+    return _related_pages_for(db, page_id, user.org_id, limit=5)
+
+
+# ── WIKI INTELLIGENCE ────────────────────────────────────────────────────────
+
+@router.get("/intelligence")
+async def wiki_intelligence(
+    space_id: Optional[str] = Query(None),
+    page_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    spaces = db.query(WikiSpace).filter(WikiSpace.org_id == user.org_id).order_by(WikiSpace.name).all()
+    pages_q = db.query(WikiPage).filter(
+        WikiPage.org_id == user.org_id,
+        WikiPage.is_deleted == False,
+    )
+    if space_id:
+        pages_q = pages_q.filter(WikiPage.space_id == space_id)
+    pages = pages_q.order_by(WikiPage.updated_at.desc()).all()
+
+    related_by_page = {
+        page.id: _related_pages_for(db, page.id, user.org_id, limit=5)
+        for page in pages[:80]
+    }
+
+    space_health = []
+    for space in spaces:
+        space_pages = [page for page in pages if page.space_id == space.id] if space_id else [
+            page for page in db.query(WikiPage).filter(
+                WikiPage.org_id == user.org_id,
+                WikiPage.space_id == space.id,
+                WikiPage.is_deleted == False,
+            ).all()
+        ]
+        local_related = {
+            page.id: related_by_page.get(page.id, _related_pages_for(db, page.id, user.org_id, limit=5))
+            for page in space_pages[:80]
+        }
+        space_health.append(_space_health(space, space_pages, local_related))
+
+    page_health = None
+    stale_pages = []
+    page_metrics_rows = []
+    if pages:
+        for page in pages:
+            metrics = _page_health_from_related(page, related_by_page.get(page.id, []))
+            page_metrics_rows.append((page, metrics))
+        stale_pages = [
+            {
+                "id": page.id,
+                "title": page.title,
+                "days_old": metrics["days_old"],
+                "linked_tickets": metrics["linked_tickets"],
+                "score": metrics["score"],
+            }
+            for page, metrics in page_metrics_rows
+            if metrics["freshness"] == "stale"
+        ][:5]
+
+        if page_id:
+            target = next((row for row in page_metrics_rows if row[0].id == page_id), None)
+            if target:
+                page, metrics = target
+                page_health = {
+                    **metrics,
+                    "page_id": page.id,
+                    "title": page.title,
+                    "related_pages": related_by_page.get(page.id, []),
+                }
+
+    return {
+        "spaces": space_health,
+        "page_health": page_health,
+        "stale_pages": stale_pages,
+        "onboarding_path": _onboarding_path(pages, related_by_page) if pages else [],
+        "map_stats": {
+            "fresh": sum(1 for _, metrics in page_metrics_rows if metrics["freshness"] == "fresh"),
+            "aging": sum(1 for _, metrics in page_metrics_rows if metrics["freshness"] == "aging"),
+            "stale": sum(1 for _, metrics in page_metrics_rows if metrics["freshness"] == "stale"),
+        },
+    }
+
+
+@router.post("/ai/assist")
+async def wiki_assist(
+    body: dict,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    from app.ai.nova import chat
+    from app.models.sprint import KnowledgeGap
+
+    message = (body.get("message") or "").strip()
+    page_id = body.get("page_id")
+    space_id = body.get("space_id")
+    if not message:
+        raise HTTPException(400, "Message is required")
+
+    page = None
+    if page_id:
+        page = db.query(WikiPage).filter(
+            WikiPage.id == page_id,
+            WikiPage.org_id == user.org_id,
+            WikiPage.is_deleted == False,
+        ).first()
+
+    pages_q = db.query(WikiPage).filter(
+        WikiPage.org_id == user.org_id,
+        WikiPage.is_deleted == False,
+    )
+    if space_id:
+        pages_q = pages_q.filter(WikiPage.space_id == space_id)
+    scope_pages = pages_q.order_by(WikiPage.updated_at.desc()).limit(25).all()
+    page_titles = "\n".join(f"- {p.title}" for p in scope_pages[:12])
+    page_context = ""
+    if page:
+        related = _related_pages_for(db, page.id, user.org_id, limit=4)
+        page_context = "\n".join([
+            f"Active page title: {page.title}",
+            f"Active page content:\n{_page_text(page)[:3000]}",
+            "Related pages:",
+            *[f"- {r['title']} ({round(float(r.get('similarity', 0) or 0) * 100)}% similar)" for r in related],
+        ])
+
+    knowledge_gaps = db.query(KnowledgeGap).filter(
+        KnowledgeGap.org_id == user.org_id,
+    ).order_by(KnowledgeGap.detected_at.desc()).limit(8).all()
+    gaps_context = "\n".join(
+        f"- {gap.topic}: {gap.wiki_coverage}% coverage, {gap.ticket_count} tickets"
+        for gap in knowledge_gaps
+    )
+
+    prompt = "\n\n".join(part for part in [
+        f"User request: {message}",
+        f"Visible wiki pages:\n{page_titles}" if page_titles else "",
+        page_context,
+        f"Knowledge gaps:\n{gaps_context}" if gaps_context else "",
+        "Answer specifically for the wiki workspace. Be concise and actionable. If asked for stale pages, conflicts, onboarding, or coverage gaps, use the provided wiki context and name concrete pages when possible.",
+    ] if part)
+
     try:
-        rows = db.execute(text("""
-            SELECT wp.id, wp.title, wp.space_id,
-                   1 - (we.embedding <=> (
-                       SELECT embedding FROM wiki_embeddings WHERE page_id = :pid
-                   )) AS similarity
-            FROM wiki_embeddings we
-            JOIN wiki_pages wp ON we.page_id = wp.id
-            WHERE wp.org_id  = :org_id
-              AND wp.id      != :pid
-              AND wp.is_deleted = false
-            ORDER BY similarity DESC
-            LIMIT 5
-        """), {"pid": page_id, "org_id": user.org_id}).fetchall()
-        return [dict(r._mapping) for r in rows]
-    except Exception:
-        return []
+        answer = await chat(prompt, temperature=0, max_tokens=500)
+        return {"answer": answer}
+    except Exception as e:
+        raise HTTPException(503, f"Wiki assistant unavailable: {e}")
 
 
 # ── AI MEETING NOTES ──────────────────────────────────────────────────────────
@@ -356,6 +640,9 @@ async def extract_meeting_actions(
     editor: User = Depends(get_editor),
 ):
     from app.ai.nova import chat
+    notes = (body.notes or body.content or "").strip()
+    if not notes:
+        raise HTTPException(400, "Notes are required")
 
     prompt = """Extract action items from these meeting notes.
 Return ONLY valid JSON — no other text.
@@ -373,13 +660,34 @@ Return JSON with this exact shape:
       "priority": "High|Medium|Low"
     }}
   ]
-}}""".format(notes=body.notes)
+}}""".format(notes=notes)
 
     try:
         raw   = await chat(prompt, temperature=0, max_tokens=800)
         start = raw.find("{")
         end   = raw.rfind("}") + 1
         data  = json.loads(raw[start:end])
-        return MeetingNotesOut(action_items=data.get("action_items", []))
+        actions = data.get("action_items", [])
+        action_lines = "\n".join(
+            f"- [ ] {item.get('action', 'Follow up')} ({item.get('priority', 'Medium')}"
+            + (f" · {item.get('owner')}" if item.get("owner") else "")
+            + (f" · due {item.get('due')}" if item.get("due") else "")
+            + ")"
+            for item in actions
+        ) or "- [ ] Review notes and assign follow-ups"
+        structured_md = "\n".join([
+            "# Meeting Notes",
+            "",
+            f"> Structured by EOS · {datetime.now().strftime('%B %d, %Y')}",
+            "",
+            "## Raw Notes",
+            "",
+            notes[:3000],
+            "",
+            "## Action Items",
+            "",
+            action_lines,
+        ])
+        return MeetingNotesOut(action_items=actions, structured_md=structured_md)
     except Exception as e:
         raise HTTPException(422, f"NOVA could not parse meeting notes: {e}")

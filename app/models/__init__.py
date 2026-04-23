@@ -20,4 +20,5 @@ from app.models.epic         import Epic  # noqa: F401
 from app.models.notification import Notification  # noqa: F401
 from app.models.client       import ClientBudget, BurnRateAlert  # noqa: F401
 from app.models.goal         import Goal  # noqa: F401
-from app.models.space_brief  import SpaceBrief  # noqa: F401
+from app.models.space_brief  import SpaceBrief   # noqa: F401
+from app.models.space_member import SpaceMember  # noqa: F401

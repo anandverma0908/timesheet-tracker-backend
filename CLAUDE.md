@@ -51,7 +51,7 @@ JWT_SECRET=<openssl rand -hex 32>
 EMBEDDING_MODEL=all-MiniLM-L6-v2
 NOVA_MODEL=llama3.1:8b
 NOVA_BASE_URL=http://ollama:11434
-NOVA_TEMPERATURE=0.3
+NOVA_temperature=0
 NOVA_MAX_TOKENS=1500
 SMTP_HOST=mailhog
 SMTP_PORT=1025
@@ -244,7 +244,7 @@ Return JSON with these exact fields:
 async def analyse_ticket(text: str) -> dict:
     """Step 1 — extract structured fields from NL text via NOVA."""
     try:
-        raw   = await chat(TICKET_CLASSIFY_PROMPT.format(text=text), temperature=0.1, max_tokens=500)
+        raw   = await chat(TICKET_CLASSIFY_PROMPT.format(text=text), temperature=0, max_tokens=500)
         start = raw.find("{")
         end   = raw.rfind("}") + 1
         return json.loads(raw[start:end])
@@ -321,7 +321,7 @@ async def nl_query(query: str, org_id: str) -> dict:
     answer   = await chat(
         user_message=f"Question: {query}\n\nAnswer based on the context provided:",
         context_docs=contexts,
-        temperature=0.2,
+        temperature=0,
     )
     return {"answer": answer, "sources": results}
 

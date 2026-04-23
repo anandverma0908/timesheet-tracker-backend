@@ -6,12 +6,12 @@ Cache survives as long as the server process is running.
 """
 
 import time
-from typing import Any
+from typing import Any, Optional
 
-_store: dict[str, tuple[Any, float]] = {}  # key → (value, expires_at)
+_store: dict = {}  # key → (value, expires_at)
 
 
-def get(key: str) -> Any | None:
+def get(key: str) -> Optional[Any]:
     entry = _store.get(key)
     if entry is None:
         return None

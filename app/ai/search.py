@@ -60,7 +60,7 @@ async def nl_query(query: str, org_id: str) -> dict:
     answer   = await chat(
         user_message=f"Question: {query}\n\nAnswer based on the context provided:",
         context_docs=contexts,
-        temperature=0.2,
+        temperature=0,
     )
     return {"answer": answer, "sources": results}
 
@@ -85,6 +85,9 @@ async def find_similar_tickets(
             ORDER BY te.embedding <=> CAST(:emb AS vector) LIMIT :limit
         """), {"emb": emb, "org_id": org_id, "threshold": threshold, "limit": limit}).fetchall()
         return [dict(r._mapping) for r in rows]
+    except Exception:
+        # No embeddings yet or vector column unavailable — return empty, don't crash
+        return []
     finally:
         db.close()
 

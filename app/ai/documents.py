@@ -62,7 +62,7 @@ Write a retrospective with these sections in markdown:
 
 Be specific, reference actual ticket names."""
 
-    return await chat(prompt, temperature=0.4, max_tokens=1200)
+    return await chat(prompt, temperature=0, max_tokens=1200)
 
 
 async def generate_release_notes(sprint_id: str, org_id: str, db) -> str:
@@ -106,7 +106,7 @@ Write clean, user-facing release notes in markdown:
 
 Use bullet points. Keep language clear for both technical and non-technical readers."""
 
-    return await chat(prompt, temperature=0.3, max_tokens=800)
+    return await chat(prompt, temperature=0, max_tokens=800)
 
 
 async def extract_action_items(meeting_notes: str) -> list[dict]:
@@ -129,7 +129,7 @@ Return:
   ]
 }}"""
     try:
-        raw   = await chat(prompt, temperature=0.1, max_tokens=600)
+        raw   = await chat(prompt, temperature=0, max_tokens=600)
         start = raw.find("{")
         end   = raw.rfind("}") + 1
         return json.loads(raw[start:end]).get("action_items", [])
@@ -193,7 +193,7 @@ Write a natural, first-person standup update:
 Be concise — 2-3 bullet points per section max."""
 
     try:
-        raw_text = await chat(prompt, temperature=0.4, max_tokens=400)
+        raw_text = await chat(prompt, temperature=0, max_tokens=400)
     except Exception as e:
         logger.warning(f"NOVA standup generation failed: {e}")
         raw_text = f"Yesterday: {yesterday_summary}\nToday: {today_summary}\nBlockers: None"

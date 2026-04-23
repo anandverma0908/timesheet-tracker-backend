@@ -283,6 +283,7 @@ async def get_my_work(
     from app.ai.nova import chat
     from app.models.ticket import JiraTicket, Worklog
     from app.models.sprint import Sprint as SprintModel
+    from app.core import cache as _cache
 
     DONE  = {"Done", "Closed", "Resolved", "Won't Fix", "Duplicate", "Cancelled", "Rejected"}
     today = date.today()
@@ -381,29 +382,47 @@ Return ONLY JSON — no prose:
 Return ONLY a JSON array (exclude already-blocked tickets, max 3):
 [{{"key":"...","reason":"specific risk reason","hours_until_block":24,"confidence":0.75}}]"""
 
+    _no_ticket_rule = (
+        "There are NO open tickets. Do NOT mention, invent, or reference any ticket key or number. Say the slate is clear."
+        if not open_tickets else
+        f"Mention the most urgent ticket by key. Only use keys from this list: {', '.join(t.jira_key for t in priority_order)}. Never invent a key."
+    )
     brief_prompt = f"""{greeting}, {first_name}. {time_ctx}. {sprint_ctx}.
 Open: {len(open_tickets)}, WIP: {len(wip_tickets)}, Blocked: {len(blocked_tickets)}, Overdue: {len(overdue_tickets)}.
-Top ticket: {priority_order[0].jira_key if priority_order else 'none'}.
 
-Write 2-3 sentences. Be specific, warm, actionable. Mention most urgent ticket by key. Flag blockers or sprint risk if present."""
+Write 2-3 sentences. Be specific, warm, actionable. Flag blockers or sprint risk if present.
+{_no_ticket_rule}"""
+
+    # ── Stable cache key for AI outputs ──────────────────────────────────────
+    ai_cache_key = f"my_work_ai:{user.id}:{_compute_data_hash(ticket_ctx, sprint_ctx, len(open_tickets), len(wip_tickets), len(blocked_tickets))}"
+    cached_ai = _cache.get(ai_cache_key)
 
     # ── Parallel NOVA calls ───────────────────────────────────────────────────
     async def _safe_nova(prompt: str, label: str, tokens: int = 400) -> Optional[str]:
         try:
             return await asyncio.wait_for(
-                chat(user_message=prompt, temperature=0.2, max_tokens=tokens),
+                chat(user_message=prompt, temperature=0, max_tokens=tokens),
                 timeout=14.0,
             )
-        except Exception as exc:
-            logger.warning("NOVA %s failed: %s", label, exc)
+        except Exception:
             return None
 
-    rank_raw, flow_raw, blocker_raw, brief_raw = await asyncio.gather(
-        _safe_nova(rank_prompt,    "rank",    500),
-        _safe_nova(flow_prompt,    "flow",    200),
-        _safe_nova(blocker_prompt, "blocker", 300),
-        _safe_nova(brief_prompt,   "brief",   180),
-    )
+    if cached_ai:
+        rank_raw, flow_raw, blocker_raw, brief_raw = (
+            cached_ai.get("rank"), cached_ai.get("flow"),
+            cached_ai.get("blocker"), cached_ai.get("brief"),
+        )
+    else:
+        rank_raw, flow_raw, blocker_raw, brief_raw = await asyncio.gather(
+            _safe_nova(rank_prompt,    "rank",    500),
+            _safe_nova(flow_prompt,    "flow",    200),
+            _safe_nova(blocker_prompt, "blocker", 300),
+            _safe_nova(brief_prompt,   "brief",   180),
+        )
+        _cache.set(ai_cache_key, {
+            "rank": rank_raw, "flow": flow_raw,
+            "blocker": blocker_raw, "brief": brief_raw,
+        }, ttl_seconds=4 * 3600)
 
     # ── Parse + fallback ──────────────────────────────────────────────────────
     priority_queue      = _parse_nova_json(rank_raw)
@@ -479,7 +498,7 @@ async def nova_query(
             answer   = await chat(
                 user_message=f"Question: {body.query}\n\nAnswer based on the context provided:",
                 context_docs=contexts,
-                temperature=0.2,
+                temperature=0,
             )
         else:
             data    = await nl_query(body.query, user.org_id)
@@ -686,6 +705,7 @@ async def get_my_brief(
     from app.models.ticket import JiraTicket
     from app.models.sprint import Sprint as SprintModel
     from datetime import datetime
+    from app.core import cache as _cache
 
     DONE = {"Done", "Closed", "Resolved", "Won't Fix", "Duplicate", "Cancelled", "Rejected"}
 
@@ -727,6 +747,7 @@ async def get_my_brief(
             sp_tickets = db.query(JiraTicket).filter(
                 JiraTicket.sprint_id == active_sprint.id,
                 JiraTicket.org_id    == user.org_id,
+                JiraTicket.assignee  == user.name,
             ).all()
             committed = sum(t.story_points or 0 for t in sp_tickets)
             done_pts  = sum(t.story_points or 0 for t in sp_tickets if t.status in DONE)
@@ -761,27 +782,45 @@ async def get_my_brief(
         if sprint_probability is not None else "No active sprint."
     )
 
-    prompt = f"""User: {user.name}
+    first = (user.name or "there").split()[0]
+
+    # Stable cache key based on ticket state — same data → same brief across refreshes
+    brief_cache_key = f"my_brief:{user.id}:{_compute_data_hash(ticket_ctx, sprint_ctx, blocker_count, wip_count, overdue_count)}"
+    cached_brief = _cache.get(brief_cache_key)
+
+    no_ticket_instruction = (
+        "There are NO open tickets. Do NOT mention, invent, or reference any ticket key or number whatsoever."
+        if not open_tickets else
+        "ONLY mention ticket keys that appear verbatim in the list above. Never invent any key not in the list."
+    )
+
+    prompt = f"""You are EOS. Write a personalised morning brief for {first}.
+
 Open tickets ({len(open_tickets)} total):
 {ticket_ctx}
 
 {sprint_ctx}
 Blockers: {blocker_count}, WIP: {wip_count}, Overdue: {overdue_count}.
 
-Write a concise, warm, and actionable morning brief (2-4 sentences) for {user.name.split()[0]}.
-Mention the most urgent ticket by key if there is one.
-Highlight any critical blockers or sprint risk if relevant.
-Keep it conversational — like a smart teammate giving a quick heads-up."""
+Rules:
+- {no_ticket_instruction}
+- 2-3 sentences max. Conversational, like a smart teammate giving a quick heads-up."""
 
-    try:
-        brief_text = await chat(
-            user_message=prompt,
-            temperature=0.5,
-            max_tokens=180,
-        )
-    except Exception:
-        # Fallback if NOVA unavailable
-        first = user.name.split()[0] if user.name else "there"
+    if cached_brief:
+        brief_text = cached_brief
+    else:
+        try:
+            brief_text = await chat(
+                user_message=prompt,
+                temperature=0,
+                max_tokens=180,
+            )
+            if brief_text:
+                _cache.set(brief_cache_key, brief_text, ttl_seconds=4 * 3600)
+        except Exception:
+            brief_text = None
+
+    if not brief_text:
         brief_text = f"Good morning, {first}. You have {len(open_tickets)} open tickets."
         if blocker_count:
             brief_text += f" {blocker_count} ticket{'s are' if blocker_count > 1 else ' is'} blocked — worth addressing first."
@@ -916,7 +955,7 @@ Then return exactly 3 insight signals in this JSON format — no prose before or
 
     try:
         raw = await asyncio.wait_for(
-            chat(user_message=prompt, temperature=0.0, max_tokens=350),
+            chat(user_message=prompt, temperature=0, max_tokens=350),
             timeout=15.0,
         )
         data = _parse_nova_json(raw)
@@ -1050,7 +1089,7 @@ Rules:
 
     try:
         raw = await asyncio.wait_for(
-            chat(user_message=prompt, temperature=0.2, max_tokens=400),
+            chat(user_message=prompt, temperature=0, max_tokens=400),
             timeout=15.0,
         )
         suggestions = _parse_nova_json(raw)
@@ -1145,7 +1184,7 @@ Return ONLY a JSON array — no prose:
 
     try:
         raw = await asyncio.wait_for(
-            chat(user_message=prompt, temperature=0.2, max_tokens=600),
+            chat(user_message=prompt, temperature=0, max_tokens=600),
             timeout=20.0,
         )
         tickets = _parse_nova_json(raw)
@@ -1289,7 +1328,7 @@ If at risk or behind, flag the critical path and suggest one concrete action."""
     try:
         insight = await chat(
             user_message=prompt,
-            temperature=0.0,
+            temperature=0,
             max_tokens=200,
         )
     except Exception:

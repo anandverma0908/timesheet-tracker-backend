@@ -123,3 +123,5 @@ class TicketEmbedding(Base):
     ticket = relationship("JiraTicket", back_populates="embedding")
 
     __table_args__ = (Index("ix_te_ticket", "ticket_id"),)
+
+    # embedding column added back via raw SQL below (pgvector type not in SQLAlchemy by default)

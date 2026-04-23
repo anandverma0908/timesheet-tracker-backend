@@ -28,7 +28,7 @@ Return JSON with these exact fields:
 async def analyse_ticket(text: str) -> dict:
     """Step 1 — extract structured fields from NL text via NOVA."""
     try:
-        raw   = await chat(TICKET_CLASSIFY_PROMPT.format(text=text), temperature=0.1, max_tokens=500)
+        raw   = await chat(TICKET_CLASSIFY_PROMPT.format(text=text), temperature=0, max_tokens=500)
         start = raw.find("{")
         end   = raw.rfind("}") + 1
         return json.loads(raw[start:end])

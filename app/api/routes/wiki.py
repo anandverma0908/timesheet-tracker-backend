@@ -376,7 +376,7 @@ Return JSON with this exact shape:
 }}""".format(notes=body.notes)
 
     try:
-        raw   = await chat(prompt, temperature=0.1, max_tokens=800)
+        raw   = await chat(prompt, temperature=0, max_tokens=800)
         start = raw.find("{")
         end   = raw.rfind("}") + 1
         data  = json.loads(raw[start:end])

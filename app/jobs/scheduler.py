@@ -165,7 +165,7 @@ async def _burnrate_job():
                                 f"{float(budget.budget_hours):.1f} budgeted hours ({burn_pct:.0f}%) "
                                 f"with {days_remaining} days remaining in the month. "
                                 "Write a concise 2-sentence alert for the project manager.",
-                                temperature=0.3,
+                                temperature=0,
                                 max_tokens=150,
                             )
                         except Exception:

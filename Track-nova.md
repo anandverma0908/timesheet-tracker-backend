@@ -149,7 +149,7 @@ volumes:
 NOVA_MODEL=llama3.1:8b
 NOVA_BASE_URL=http://ollama:11434
 EMBEDDING_MODEL=all-MiniLM-L6-v2
-NOVA_TEMPERATURE=0.3
+NOVA_temperature=0
 NOVA_MAX_TOKENS=1500
 ```
 
@@ -599,7 +599,7 @@ EMBEDDING_MODEL=all-MiniLM-L6-v2
 # NOVA AI — 100% local, no external API keys needed
 NOVA_MODEL=llama3.1:8b
 NOVA_BASE_URL=http://ollama:11434
-NOVA_TEMPERATURE=0.3
+NOVA_temperature=0
 NOVA_MAX_TOKENS=1500
 
 # Email (dev only)

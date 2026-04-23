@@ -2,15 +2,18 @@
 app/api/routes/spaces.py — Project/Space detail aggregation for the Spaces feature.
 
 Endpoints:
-  GET /api/spaces                  List all spaces with health scores
-  GET /api/spaces/{pod}/project    Full project payload (matches frontend Project type)
-  GET /api/spaces/{pod}/health     Unified health score + radar + risk flags
-  GET /api/spaces/anomalies        Rule-based anomaly detection across all pods
-  GET /api/spaces/dependencies     Cross-space blocker dependency map
-  GET /api/spaces/{pod}/backlog    Tickets in this pod not assigned to any sprint
-  GET /api/spaces/{pod}/epics      Epics for this pod
-  POST /api/spaces                 Create a new space
-  DELETE /api/spaces/{pod}         Delete a space and all its data
+  GET    /api/spaces                       List all spaces with health scores
+  GET    /api/spaces/{pod}/project         Full project payload (matches frontend Project type)
+  GET    /api/spaces/{pod}/health          Unified health score + radar + risk flags
+  GET    /api/spaces/anomalies             Rule-based anomaly detection across all pods
+  GET    /api/spaces/dependencies          Cross-space blocker dependency map
+  GET    /api/spaces/{pod}/backlog         Tickets in this pod not assigned to any sprint
+  GET    /api/spaces/{pod}/epics           Epics for this pod
+  POST   /api/spaces                       Create a new space (with optional member_ids)
+  DELETE /api/spaces/{pod}                 Delete a space and all its data
+  GET    /api/spaces/{pod}/members         List space members
+  POST   /api/spaces/{pod}/members         Add a member to a space
+  DELETE /api/spaces/{pod}/members/{uid}   Remove a member from a space
 """
 
 from datetime import date, timedelta
@@ -27,12 +30,20 @@ from app.core.dependencies import get_current_user, get_manager_up
 router = APIRouter(prefix="/api/spaces", tags=["spaces"])
 
 
+from typing import List as _List
+
 class SpaceCreatePayload(BaseModel):
     key: str
     name: str
     description: str
     category: str
     color: str
+    member_ids: _List[str] = []
+
+
+class AddMemberPayload(BaseModel):
+    user_id: str
+    role: str = "member"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -408,25 +419,27 @@ async def get_space_project(
     ).first()
     total_hours = round(float(total_hours_row.total_hours or 0), 2) if total_hours_row else 0
 
-    # ── Members derived from assignees ──
-    assignees = db.query(
-        JiraTicket.assignee,
-        func.count(JiraTicket.id).label("ticket_count"),
-    ).filter(
-        JiraTicket.org_id == org_id,
-        JiraTicket.pod == pod,
-        JiraTicket.is_deleted == False,
-        JiraTicket.assignee != None,
-    ).group_by(JiraTicket.assignee).order_by(func.count(JiraTicket.id).desc()).all()
+    # ── Members from space_members table ──
+    from app.models.space_member import SpaceMember
+    from app.models.user import User as UserModel
+
+    space_member_rows = db.query(SpaceMember).filter(
+        SpaceMember.org_id == org_id,
+        SpaceMember.pod == pod,
+    ).all()
 
     members = []
-    for i, (name, _cnt) in enumerate(assignees):
+    for sm in space_member_rows:
+        u = sm.user
+        if not u:
+            continue
         members.append({
-            "id": f"m-{pod}-{i}",
-            "name": name,
-            "role": "Team Member",
-            "initials": _initials(name),
-            "color": _hash_color(name),
+            "id":       u.id,
+            "name":     u.name,
+            "email":    u.email,
+            "role":     sm.role.capitalize(),
+            "initials": _initials(u.name),
+            "color":    _hash_color(u.name),
         })
 
     lead = members[0]["name"] if members else ""
@@ -478,10 +491,11 @@ async def get_space_project(
                     "dueDate": t.due_date.isoformat() if t.due_date else None,
                     "createdAt": t.jira_created.isoformat() if t.jira_created else "",
                     "updatedAt": t.jira_updated.isoformat() if t.jira_updated else "",
-                    "description": t.description or f"{t.summary} — detailed description.",
-                    "labels": [],
+                    "description": t.description or "",
+                    "labels": t.labels or [],
                     "sprint": sp.id,
                     "epicId": t.epic_id,
+                    "pod": t.pod,
                 }
                 for idx, t in enumerate(sp_tickets)
             ],
@@ -549,13 +563,14 @@ async def get_space_project(
             "assigneeInitials": _initials(t.assignee),
             "assigneeColor": _hash_color(t.assignee or str(idx)),
             "storyPoints": t.story_points or 0,
-            "dueDate": t.jira_updated.isoformat() if t.jira_updated else None,
+            "dueDate": t.due_date.isoformat() if t.due_date else None,
             "createdAt": t.jira_created.isoformat() if t.jira_created else "",
             "updatedAt": t.jira_updated.isoformat() if t.jira_updated else "",
-            "description": t.description or f"{t.summary} — detailed description.",
-            "labels": [],
+            "description": t.description or "",
+            "labels": t.labels or [],
             "sprint": "backlog",
             "epicId": t.epic_id,
+            "pod": t.pod,
         }
         for idx, t in enumerate(backlog)
     ]
@@ -662,8 +677,10 @@ async def create_space(
     db: Session = Depends(get_db),
     user = Depends(get_manager_up),
 ):
-    """Create a new space by inserting a planning sprint for the POD."""
+    """Create a new space with an initial sprint and assign members."""
     from app.models.sprint import Sprint
+    from app.models.space_member import SpaceMember
+    from app.models.user import User as UserModel
 
     org_id = user.org_id
     pod = payload.key.strip().upper()
@@ -688,8 +705,105 @@ async def create_space(
         end_date=today + timedelta(days=14),
     )
     db.add(sprint)
+
+    # Assign members — first member becomes lead
+    seen = set()
+    for i, uid in enumerate(payload.member_ids):
+        if uid in seen:
+            continue
+        seen.add(uid)
+        u = db.query(UserModel).filter(UserModel.id == uid, UserModel.org_id == org_id).first()
+        if not u:
+            continue
+        db.add(SpaceMember(
+            org_id=org_id,
+            pod=pod,
+            user_id=uid,
+            role="lead" if i == 0 else "member",
+        ))
+
     db.commit()
-    return {"pod": pod, "name": payload.name, "status": "created"}
+    return {"pod": pod, "name": payload.name, "status": "created", "member_count": len(seen)}
+
+
+@router.get("/{pod}/members")
+async def list_space_members(
+    pod: str,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """List all members of a space."""
+    from app.models.space_member import SpaceMember
+
+    rows = db.query(SpaceMember).filter(
+        SpaceMember.org_id == user.org_id,
+        SpaceMember.pod == pod,
+    ).all()
+
+    return [
+        {
+            "id":       sm.user.id,
+            "name":     sm.user.name,
+            "email":    sm.user.email,
+            "role":     sm.role,
+            "initials": _initials(sm.user.name),
+            "color":    _hash_color(sm.user.name),
+        }
+        for sm in rows if sm.user
+    ]
+
+
+@router.post("/{pod}/members")
+async def add_space_member(
+    pod: str,
+    body: AddMemberPayload,
+    db: Session = Depends(get_db),
+    user = Depends(get_manager_up),
+):
+    """Add a user to a space."""
+    from app.models.space_member import SpaceMember
+    from app.models.user import User as UserModel
+
+    u = db.query(UserModel).filter(UserModel.id == body.user_id, UserModel.org_id == user.org_id).first()
+    if not u:
+        raise HTTPException(404, "User not found")
+
+    existing = db.query(SpaceMember).filter(
+        SpaceMember.org_id == user.org_id,
+        SpaceMember.pod == pod,
+        SpaceMember.user_id == body.user_id,
+    ).first()
+    if existing:
+        existing.role = body.role
+        db.commit()
+        return {"status": "updated"}
+
+    db.add(SpaceMember(org_id=user.org_id, pod=pod, user_id=body.user_id, role=body.role))
+    db.commit()
+    return {"status": "added"}
+
+
+@router.delete("/{pod}/members/{user_id}")
+async def remove_space_member(
+    pod: str,
+    user_id: str,
+    db: Session = Depends(get_db),
+    user = Depends(get_manager_up),
+):
+    """Remove a user from a space."""
+    from app.models.space_member import SpaceMember
+
+    row = db.query(SpaceMember).filter(
+        SpaceMember.org_id == user.org_id,
+        SpaceMember.pod == pod,
+        SpaceMember.user_id == user_id,
+    ).first()
+    if not row:
+        raise HTTPException(404, "Member not found")
+
+    db.delete(row)
+    db.commit()
+    return {"status": "removed"}
 
 
 @router.delete("/{pod}")

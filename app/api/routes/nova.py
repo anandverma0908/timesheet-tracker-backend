@@ -481,31 +481,86 @@ Write 2-3 sentences. Be specific, warm, actionable. Flag blockers or sprint risk
     }
 
 
+class GenerateRequest(BaseModel):
+    prompt: str
+    system_prompt: Optional[str] = None
+    temperature: float = 0.3
+    max_tokens: int = 800
+
+
+@router.post("/generate")
+async def nova_generate(
+    body: GenerateRequest,
+    user: User = Depends(get_current_user),
+):
+    """Direct LLM call — no RAG. Used for ticket structuring, doc generation, etc."""
+    from app.ai.nova import chat
+    try:
+        answer = await chat(
+            user_message=body.prompt,
+            system_prompt=body.system_prompt,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+        )
+        return {"answer": answer}
+    except Exception as e:
+        raise HTTPException(503, f"NOVA is unavailable: {e}")
+
+
 @router.post("/query", response_model=NovaQueryOut)
 async def nova_query(
     body: NovaQueryRequest,
-    user: User = Depends(get_current_user),
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
 ):
-    """RAG-powered natural language query over tickets + wiki."""
-    from app.ai.search import nl_query, semantic_search
-    from app.ai.nova import chat
+    """RAG + keyword search with full user/project context injected."""
+    from app.ai.search import nl_query
+    from app.models.ticket import JiraTicket
+    from app.models.sprint import Sprint as SprintModel
+    from datetime import date
 
     try:
-        if body.scope == "tickets":
-            results  = await semantic_search(body.query, user.org_id, limit=5)
-            results  = [r for r in results if r.get("source_type") == "ticket"]
-            contexts = [f"[TICKET] {r['title']}\n{r['snippet']}" for r in results]
-            answer   = await chat(
-                user_message=f"Question: {body.query}\n\nAnswer based on the context provided:",
-                context_docs=contexts,
-                temperature=0,
-            )
-        else:
-            data    = await nl_query(body.query, user.org_id)
-            answer  = data["answer"]
-            results = data["sources"]
+        # ── Build live project context ────────────────────────────────────────
+        DONE = {"Done","Closed","Resolved","Won't Fix","Duplicate","Cancelled","Rejected"}
+        today = date.today()
 
-        return NovaQueryOut(answer=answer, sources=results)
+        all_tix = db.query(JiraTicket).filter(
+            JiraTicket.org_id    == user.org_id,
+            JiraTicket.is_deleted == False,
+        ).all()
+        open_tix    = [t for t in all_tix if (t.status or "") not in DONE]
+        my_tix      = [t for t in open_tix if t.assignee == user.name]
+        blocked     = [t for t in open_tix if "block" in (t.status or "").lower()]
+        overdue     = [t for t in open_tix if t.due_date and t.due_date < today]
+
+        sprint = db.query(SprintModel).filter(
+            SprintModel.org_id == user.org_id,
+            SprintModel.status == "active",
+        ).first()
+
+        # Compact context string injected into every Nova query
+        ctx_lines = [
+            f"Engineer asking: {user.name} (role: {user.role or 'engineer'}).",
+            f"Project has {len(open_tix)} open tickets total; {len(my_tix)} assigned to {user.name}.",
+        ]
+        if blocked:
+            ctx_lines.append(f"Currently blocked: {', '.join(t.jira_key + ' (' + (t.summary or '')[:40] + ')' for t in blocked[:4])}.")
+        if overdue:
+            ctx_lines.append(f"Overdue: {', '.join(t.jira_key for t in overdue[:4])}.")
+        if sprint:
+            days_left = max(0, (sprint.end_date - today).days) if sprint.end_date else "?"
+            ctx_lines.append(f"Active sprint: '{sprint.name}' — {days_left} days left.")
+        if my_tix:
+            ctx_lines.append(
+                "My open tickets: " +
+                "; ".join(f"{t.jira_key} [{t.status}] {(t.summary or '')[:50]}" for t in my_tix[:6]) + "."
+            )
+
+        user_context = " ".join(ctx_lines)
+
+        data    = await nl_query(body.query, user.org_id, user_context=user_context)
+        return NovaQueryOut(answer=data["answer"], sources=data["sources"])
+
     except Exception as e:
         raise HTTPException(503, f"NOVA is unavailable: {e}")
 

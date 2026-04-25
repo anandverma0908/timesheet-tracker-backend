@@ -6,10 +6,13 @@ so all vector casts use CAST(:param AS vector) instead of :param::vector.
 """
 
 import re
+import logging
 from sqlalchemy import text
 
 from app.ai.nova import embed, rerank, chat
 from app.core.database import SessionLocal
+
+logger = logging.getLogger(__name__)
 
 SEARCH_SYSTEM = """You are NOVA — the personal AI brain for this engineering project on Trackly.
 You know the team's tickets, decisions, wiki, and standups.
@@ -207,12 +210,14 @@ async def nl_query(query: str, org_id: str, user_context: str = "") -> dict:
 async def find_similar_tickets(
     embedding: list[float],
     org_id: str,
-    threshold: float = 0.85,
+    threshold: float = 0.72,
     limit: int = 3,
+    query_text: str = "",
 ) -> list[dict]:
     db  = SessionLocal()
     emb = str(embedding)
     try:
+        # Vector similarity search
         rows = db.execute(text("""
             SELECT t.jira_key, t.summary, t.status,
                    1 - (te.embedding <=> CAST(:emb AS vector)) as similarity
@@ -223,9 +228,48 @@ async def find_similar_tickets(
               AND 1 - (te.embedding <=> CAST(:emb AS vector)) >= :threshold
             ORDER BY te.embedding <=> CAST(:emb AS vector) LIMIT :limit
         """), {"emb": emb, "org_id": org_id, "threshold": threshold, "limit": limit}).fetchall()
-        return [dict(r._mapping) for r in rows]
-    except Exception:
-        # No embeddings yet or vector column unavailable — return empty, don't crash
+        results = [dict(r._mapping) for r in rows]
+
+        if results:
+            logger.info(f"find_similar_tickets: vector search found {len(results)} results (top similarity: {results[0].get('similarity', '?'):.3f})")
+            return results
+
+        # Log top scores even when below threshold (helps tune the threshold)
+        try:
+            top = db.execute(text("""
+                SELECT t.summary, 1 - (te.embedding <=> CAST(:emb AS vector)) as similarity
+                FROM ticket_embeddings te
+                JOIN jira_tickets t ON te.ticket_id = t.id
+                WHERE t.org_id = :org_id AND t.status != 'Done'
+                ORDER BY te.embedding <=> CAST(:emb AS vector) LIMIT 3
+            """), {"emb": emb, "org_id": org_id}).fetchall()
+            for r in top:
+                logger.info(f"find_similar_tickets: below-threshold candidate '{r.summary}' similarity={r.similarity:.3f}")
+        except Exception:
+            pass
+
+        # Keyword fallback — catches obvious title overlaps that fall below embedding threshold
+        if query_text:
+            words = [w for w in re.sub(r"[^a-z0-9 ]", "", query_text.lower()).split() if len(w) >= 4][:6]
+            if len(words) >= 2:
+                like_clauses = " AND ".join(f"LOWER(t.summary) LIKE :w{i}" for i in range(len(words)))
+                params: dict = {"org_id": org_id, "limit": limit}
+                params.update({f"w{i}": f"%{w}%" for i, w in enumerate(words)})
+                kw_rows = db.execute(text(f"""
+                    SELECT t.jira_key, t.summary, t.status, 0.65 as similarity
+                    FROM jira_tickets t
+                    WHERE t.org_id = :org_id AND t.is_deleted = false AND t.status != 'Done'
+                      AND {like_clauses}
+                    LIMIT :limit
+                """), params).fetchall()
+                kw_results = [dict(r._mapping) for r in kw_rows]
+                if kw_results:
+                    logger.info(f"find_similar_tickets: keyword fallback found {len(kw_results)} results")
+                return kw_results
+
+        return []
+    except Exception as e:
+        logger.warning(f"find_similar_tickets failed: {e}")
         return []
     finally:
         db.close()

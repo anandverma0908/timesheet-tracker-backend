@@ -214,6 +214,9 @@ async def start_sprint(
             )
 
     db.commit()
+    # Automation hook
+    from app.services.automation_engine import run_automations
+    await run_automations("sprint_started", {"sprint_id": sprint_id, "sprint_name": sprint.name}, user.org_id, sprint.pod or "", db)
     return {"message": "Sprint started", "sprint_id": sprint_id, "status": "active"}
 
 
@@ -256,6 +259,9 @@ async def complete_sprint(
         sprint.end_date = date.today()
 
     db.commit()
+    # Automation hook
+    from app.services.automation_engine import run_automations
+    await run_automations("sprint_completed", {"sprint_id": sprint_id, "sprint_name": sprint.name, "velocity": sprint.velocity}, user.org_id, sprint.pod or "", db)
     return {
         "message":          "Sprint completed",
         "sprint_id":        sprint_id,

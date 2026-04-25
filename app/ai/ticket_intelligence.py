@@ -8,7 +8,7 @@ TICKET_CLASSIFY_PROMPT = """Analyse this ticket and extract structured informati
 Return ONLY valid JSON, no other text.
 
 Ticket: {text}
-
+{user_hint}
 Return JSON with these exact fields:
 {{
   "title": "concise ticket title (max 100 chars)",
@@ -19,16 +19,21 @@ Return JSON with these exact fields:
   "client": "client name or null",
   "story_points": 1,
   "labels": ["label1"],
-  "suggested_assignee_role": "SDE1|SDE2|SDE3|SDET|BA",
+  "assignee": "exact name from the available team members list that best fits this ticket, or null",
   "confidence": 0.0,
   "reasoning": "brief explanation"
 }}"""
 
 
-async def analyse_ticket(text: str) -> dict:
+async def analyse_ticket(text: str, available_users: list = []) -> dict:
     """Step 1 — extract structured fields from NL text via NOVA."""
     try:
-        raw   = await chat(TICKET_CLASSIFY_PROMPT.format(text=text), temperature=0, max_tokens=500)
+        user_hint = (
+            f"Available team members (pick the best fit for 'assignee'): {', '.join(available_users)}"
+            if available_users else ""
+        )
+        prompt = TICKET_CLASSIFY_PROMPT.format(text=text, user_hint=user_hint)
+        raw   = await chat(prompt, temperature=0, max_tokens=500)
         start = raw.find("{")
         end   = raw.rfind("}") + 1
         return json.loads(raw[start:end])
@@ -36,11 +41,11 @@ async def analyse_ticket(text: str) -> dict:
         return {"error": str(e), "title": text[:100]}
 
 
-async def full_analysis(nl_text: str, org_id: str) -> dict:
+async def full_analysis(nl_text: str, org_id: str, available_users: list = []) -> dict:
     """Full agentic pipeline: classify + duplicate check in parallel."""
     init_embed  = embed(nl_text)
-    fields_task = analyse_ticket(nl_text)
-    dupes_task  = find_similar_tickets(init_embed, org_id, threshold=0.85, limit=3)
+    fields_task = analyse_ticket(nl_text, available_users)
+    dupes_task  = find_similar_tickets(init_embed, org_id, threshold=0.72, limit=3, query_text=nl_text)
     fields, dupes = await asyncio.gather(fields_task, dupes_task)
     return {
         "fields":         fields,

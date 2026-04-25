@@ -22,3 +22,7 @@ from app.models.client       import ClientBudget, BurnRateAlert  # noqa: F401
 from app.models.goal         import Goal  # noqa: F401
 from app.models.space_brief  import SpaceBrief   # noqa: F401
 from app.models.space_member import SpaceMember  # noqa: F401
+from app.models.saved_filter import SavedFilter  # noqa: F401
+from app.models.board_config import BoardConfig  # noqa: F401
+from app.models.release import Release  # noqa: F401
+from app.models.automation import AutomationRule  # noqa: F401

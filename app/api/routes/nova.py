@@ -507,6 +507,50 @@ async def nova_generate(
         raise HTTPException(503, f"NOVA is unavailable: {e}")
 
 
+class AgentHistoryItem(BaseModel):
+    role:    str   # "user" | "assistant"
+    content: str
+
+
+class AgentRequest(BaseModel):
+    message:        str
+    history:        list[AgentHistoryItem] = []
+    max_iterations: int = 8
+
+
+@router.post("/agent")
+async def nova_agent(
+    body: AgentRequest,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    """
+    NOVA Agent — autonomous multi-step task execution.
+
+    Runs the agent loop server-side: LLM decides which tools to call,
+    tools execute against the real DB, results feed back into the next
+    LLM call until a plain-text final answer is produced.
+
+    Returns: {answer, steps, tools_used, created_ticket}
+    """
+    from app.ai.agent import run_agent_loop
+
+    history = [{"role": h.role, "content": h.content} for h in body.history]
+    max_iter = max(1, min(body.max_iterations, 8))  # clamp 1–8
+
+    try:
+        result = await run_agent_loop(
+            user_message=body.message,
+            user=user,
+            db=db,
+            history=history,
+            max_iterations=max_iter,
+        )
+        return result
+    except Exception as e:
+        raise HTTPException(503, f"Agent loop failed: {e}")
+
+
 @router.post("/query", response_model=NovaQueryOut)
 async def nova_query(
     body: NovaQueryRequest,
@@ -636,13 +680,17 @@ async def get_my_standup(
         return {"message": "No standup for today yet. Use POST /api/nova/standup/generate."}
 
     return {
-        "id":        standup.id,
-        "user_id":   standup.user_id,
-        "date":      standup.date.isoformat(),
-        "yesterday": standup.yesterday,
-        "today":     standup.today,
-        "blockers":  standup.blockers,
-        "is_shared": standup.is_shared,
+        "id":             standup.id,
+        "user_id":        standup.user_id,
+        "engineer":       user.name,
+        "engineer_email": user.email,
+        "pod":            user.pod or "",
+        "date":           standup.date.isoformat(),
+        "yesterday":      standup.yesterday or "",
+        "today":          standup.today or "",
+        "blockers":       standup.blockers or "",
+        "shared":         standup.is_shared,
+        "created_at":     standup.date.isoformat(),
     }
 
 
@@ -658,10 +706,36 @@ async def get_team_standups(
 
     target_date = date.fromisoformat(standup_date) if standup_date else date.today()
 
-    standups = db.query(Standup).filter(
+    # Admins are excluded from team standup views entirely
+    admin_ids = [
+        u.id for u in db.query(UserModel).filter(
+            UserModel.org_id == user.org_id,
+            UserModel.role   == "admin",
+        ).all()
+    ]
+
+    # Managers only see standups of their direct reports
+    if user.role == "engineering_manager":
+        visible_user_ids = [
+            u.id for u in db.query(UserModel).filter(
+                UserModel.org_id      == user.org_id,
+                UserModel.reporting_to == str(user.id),
+            ).all()
+        ]
+    else:
+        # Admin role (get_manager_up allows admin too) — sees everyone except other admins
+        visible_user_ids = None
+
+    query = db.query(Standup).filter(
         Standup.org_id == user.org_id,
         Standup.date   == target_date,
-    ).all()
+        ~Standup.user_id.in_(admin_ids),
+    )
+    if visible_user_ids is not None:
+        # Manager sees their own standup + direct reports
+        query = query.filter(Standup.user_id.in_(visible_user_ids + [user.id]))
+
+    standups = query.all()
 
     result = []
     for s in standups:
@@ -1215,26 +1289,50 @@ async def draft_sprint(
     ).all()
     health = compute_health(all_tickets, active_sprint)
 
+    # Build a lookup so AI responses can be validated against real DB records
+    backlog_lookup = {t.jira_key: t for t in backlog}
+
+    # Historical velocity: average completed story points across recent done sprints
+    from app.models.sprint import Sprint as SprintModel
+    recent_sprints = db.query(SprintModel).filter(
+        SprintModel.org_id == org_id,
+        SprintModel.pod == pod,
+        SprintModel.status == "completed",
+    ).order_by(SprintModel.end_date.desc()).limit(3).all()
+
+    if recent_sprints:
+        sprint_ids = [s.id for s in recent_sprints]
+        completed_pts_list = []
+        for sid in sprint_ids:
+            pts = db.query(JiraTicket).filter(
+                JiraTicket.org_id == org_id,
+                JiraTicket.sprint_id == sid,
+                JiraTicket.status.in_(["Done", "Closed", "Resolved"]),
+                JiraTicket.is_deleted == False,
+            ).all()
+            completed_pts_list.append(sum(t.story_points or 0 for t in pts))
+        avg_velocity = int(sum(completed_pts_list) / len(completed_pts_list)) if completed_pts_list else 40
+    else:
+        avg_velocity = 40
+
     backlog_ctx = "\n".join(
         f"- {t.jira_key} | {t.priority or 'Medium'} | SP:{t.story_points or '?'} | {(t.summary or '')[:70]}"
         for t in backlog[:20]
     )
 
-    prompt = f"""Pod: {pod}. Current health: {health['health_score']}/100.
-Blockers: {health['risk_flags']['blocked']}. Velocity score: {health['radar']['velocity']}%.
+    prompt = f"""Pod: {pod}. Health: {health['health_score']}/100. Blockers: {health['risk_flags']['blocked']}. Velocity score: {health['radar']['velocity']}%.
+Historical avg velocity: {avg_velocity} story points per sprint.
 
-Backlog tickets:
+Available backlog tickets (you MUST only use keys from this list — do NOT invent keys):
 {backlog_ctx}
 
-Select the best 8-10 tickets for the next sprint (standard 40-point capacity).
+Select 8-10 tickets that fit within {avg_velocity} story points total.
 Prioritise: bug fixes first, then high-priority features, then tech debt.
-Return ONLY a JSON array — no prose:
+Return ONLY a JSON array — no prose, no explanation:
 [{{
-  "key": "DPAI-123",
-  "summary": "short title",
+  "key": "EXACT-KEY-FROM-LIST-ABOVE",
   "suggested_points": 3,
-  "priority": "High",
-  "rationale": "one sentence why this belongs in the sprint"
+  "rationale": "one sentence why"
 }}]"""
 
     try:
@@ -1242,16 +1340,31 @@ Return ONLY a JSON array — no prose:
             chat(user_message=prompt, temperature=0, max_tokens=600),
             timeout=20.0,
         )
-        tickets = _parse_nova_json(raw)
-        if isinstance(tickets, list):
-            total_pts = sum(t.get("suggested_points", 0) for t in tickets)
-            return {
-                "pod":          pod,
-                "tickets":      tickets,
-                "total_points": total_pts,
-                "rationale":    f"NOVA selected {len(tickets)} tickets ({total_pts} pts) based on priority and pod health.",
-                "nova_powered": True,
-            }
+        ai_tickets = _parse_nova_json(raw)
+        if isinstance(ai_tickets, list):
+            # Validate and enrich every AI ticket against real DB records
+            validated = []
+            for item in ai_tickets:
+                key = item.get("key", "")
+                db_ticket = backlog_lookup.get(key)
+                if db_ticket is None:
+                    continue  # AI hallucinated a key — discard
+                validated.append({
+                    "key":              db_ticket.jira_key,
+                    "summary":          db_ticket.summary,          # always use real summary
+                    "priority":         db_ticket.priority or "Medium",  # always use real priority
+                    "suggested_points": item.get("suggested_points") or db_ticket.story_points or 3,
+                    "rationale":        item.get("rationale", "Selected by EOS."),
+                })
+            if validated:
+                total_pts = sum(t["suggested_points"] for t in validated)
+                return {
+                    "pod":          pod,
+                    "tickets":      validated,
+                    "total_points": total_pts,
+                    "rationale":    f"EOS selected {len(validated)} tickets ({total_pts} pts) targeting {avg_velocity}-point capacity.",
+                    "nova_powered": True,
+                }
     except Exception:
         pass
 
@@ -1401,5 +1514,245 @@ If at risk or behind, flag the critical path and suggest one concrete action."""
     goal.nova_insight = insight
     goal.nova_insight_hash = data_hash
     db.commit()
+
+
+# ── EOS Intelligence Endpoints ────────────────────────────────────────────────
+
+@router.get("/cognitive-load")
+async def cognitive_load(
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    """Cognitive load score per team member based on WIP, priority, and overdue factors."""
+    from app.models.ticket import JiraTicket
+    from app.ai.nova import chat
+    from datetime import date
+
+    org_id = user.org_id
+    today  = date.today()
+    DONE   = {"Done", "Closed", "Resolved"}
+
+    tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id     == org_id,
+        JiraTicket.is_deleted == False,
+        JiraTicket.assignee   != None,
+        JiraTicket.status.notin_(list(DONE)),
+    ).all()
+
+    assignee_stats: dict = {}
+    for t in tickets:
+        a = t.assignee
+        if a not in assignee_stats:
+            assignee_stats[a] = {"wip": 0, "high_priority": 0, "overdue": 0, "pts": 0}
+        assignee_stats[a]["wip"]          += 1
+        assignee_stats[a]["pts"]          += t.story_points or 0
+        if (t.priority or "") in ("High", "Highest"):
+            assignee_stats[a]["high_priority"] += 1
+        if t.due_date and t.due_date < today:
+            assignee_stats[a]["overdue"]   += 1
+
+    members = []
+    for name, s in assignee_stats.items():
+        raw   = s["wip"] * 10 + s["high_priority"] * 15 + s["overdue"] * 20
+        score = min(100, raw)
+        level = ("Overloaded" if score >= 70
+                 else "High"       if score >= 50
+                 else "Moderate"   if score >= 30
+                 else "Optimal")
+        members.append({
+            "name":                name,
+            "load_score":          score,
+            "level":               level,
+            "wip_count":           s["wip"],
+            "high_priority_count": s["high_priority"],
+            "overdue_count":       s["overdue"],
+            "story_points":        s["pts"],
+        })
+    members.sort(key=lambda x: x["load_score"], reverse=True)
+
+    ai_summary = "No active assignments found."
+    if members:
+        lines = "; ".join(
+            f"{m['name']}: load={m['load_score']} ({m['level']}), WIP={m['wip_count']}, overdue={m['overdue_count']}"
+            for m in members[:8]
+        )
+        prompt = (
+            f"You are EOS, an engineering team coach. Analyse cognitive load distribution.\n"
+            f"Team data: {lines}\n"
+            f"In 2 concise sentences: (1) overall pattern, "
+            f"(2) one specific recommendation for the highest-loaded member. Be direct."
+        )
+        try:
+            ai_summary = await chat(user_message=prompt, max_tokens=150)
+        except Exception:
+            ai_summary = f"{members[0]['name']} is at {members[0]['level']} cognitive load with {members[0]['wip_count']} open tickets. Consider redistributing high-priority tasks."
+
+    return {"members": members, "ai_summary": ai_summary, "total_members": len(members)}
+
+
+@router.get("/team-chemistry")
+async def team_chemistry(
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    """Team chemistry: workload balance per pod with AI collaboration analysis."""
+    from app.models.ticket import JiraTicket
+    from app.ai.nova import chat
+
+    org_id = user.org_id
+
+    tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id     == org_id,
+        JiraTicket.is_deleted == False,
+        JiraTicket.assignee   != None,
+        JiraTicket.pod        != None,
+    ).all()
+
+    pod_pts: dict = {}
+    for t in tickets:
+        pod = (t.pod or "").strip()
+        if not pod:
+            continue
+        if pod not in pod_pts:
+            pod_pts[pod] = {}
+        a = t.assignee
+        pod_pts[pod][a] = pod_pts[pod].get(a, 0) + (t.story_points or 0)
+
+    balance_data = []
+    for pod, member_pts in pod_pts.items():
+        vals = list(member_pts.values())
+        if len(vals) < 2:
+            continue
+        avg = sum(vals) / len(vals)
+        std = (sum((v - avg) ** 2 for v in vals) / len(vals)) ** 0.5
+        cv  = round((std / max(avg, 1)) * 100)
+        balance_data.append({
+            "pod":           pod,
+            "members":       len(vals),
+            "avg_pts":       round(avg, 1),
+            "imbalance_pct": cv,
+            "most_loaded":   max(member_pts, key=member_pts.get),
+            "least_loaded":  min(member_pts, key=member_pts.get),
+        })
+    balance_data.sort(key=lambda x: x["imbalance_pct"], reverse=True)
+
+    pod_summary = "; ".join(
+        f"{p['pod']}: {p['members']} members, imbalance={p['imbalance_pct']}%, top={p['most_loaded']}"
+        for p in balance_data[:5]
+    )
+
+    ai_analysis = "Not enough pod data to analyse team chemistry."
+    if balance_data:
+        prompt = (
+            f"You are EOS, an engineering team dynamics analyst.\n"
+            f"Pod workload balance: {pod_summary}\n"
+            f"Write 3 concise bullet points:\n"
+            f"• Overall cohesion pattern (silos vs collaboration)\n"
+            f"• Worst imbalance and why it matters\n"
+            f"• One specific recommendation to improve team chemistry\nBe direct."
+        )
+        try:
+            ai_analysis = await chat(user_message=prompt, max_tokens=200)
+        except Exception:
+            worst = balance_data[0]
+            ai_analysis = (
+                f"• {worst['pod']} shows the highest workload imbalance at {worst['imbalance_pct']}%.\n"
+                f"• {worst['most_loaded']} carries a disproportionate share — risk of burnout.\n"
+                f"• Redistribute 2-3 tickets from {worst['most_loaded']} to {worst['least_loaded']} this sprint."
+            )
+
+    return {"pod_balance": balance_data, "ai_analysis": ai_analysis, "pod_count": len(balance_data)}
+
+
+@router.get("/memory-graph")
+async def memory_graph(
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    """Institutional memory map: who knows what, based on ticket history, plus bus factor risks."""
+    from app.models.ticket import JiraTicket
+    from app.ai.nova import chat
+
+    org_id = user.org_id
+
+    tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id     == org_id,
+        JiraTicket.is_deleted == False,
+        JiraTicket.assignee   != None,
+    ).all()
+
+    member_data: dict    = {}
+    pod_contributors: dict = {}
+
+    for t in tickets:
+        a   = t.assignee
+        pod = (t.pod or "Unknown").strip()
+
+        if a not in member_data:
+            member_data[a] = {"pods": set(), "types": set(), "count": 0}
+        member_data[a]["pods"].add(pod)
+        if t.issue_type:
+            member_data[a]["types"].add(t.issue_type)
+        member_data[a]["count"] += 1
+
+        if pod not in pod_contributors:
+            pod_contributors[pod] = set()
+        pod_contributors[pod].add(a)
+
+    expertise_map = sorted(
+        [
+            {
+                "name":              name,
+                "pods":              sorted(d["pods"]),
+                "ticket_count":      d["count"],
+                "specializations":   sorted(d["types"]),
+                "knowledge_breadth": len(d["pods"]),
+            }
+            for name, d in member_data.items()
+        ],
+        key=lambda x: x["ticket_count"],
+        reverse=True,
+    )
+
+    bus_factor_risks = [
+        {
+            "pod":          pod,
+            "contributors": len(members),
+            "risk":         "High"   if len(members) == 1
+                            else "Medium" if len(members) == 2
+                            else "Low",
+        }
+        for pod, members in pod_contributors.items()
+        if len(members) <= 2
+    ]
+
+    top_experts = "; ".join(
+        f"{m['name']}: {m['ticket_count']} tickets across {', '.join(m['pods'][:3])}"
+        for m in expertise_map[:5]
+    )
+    high_risk = "; ".join(r["pod"] for r in bus_factor_risks if r["risk"] == "High")
+
+    ai_summary = "No ticket assignment data found."
+    if expertise_map:
+        prompt = (
+            f"You are EOS, an institutional knowledge analyst.\n"
+            f"Top contributors: {top_experts or 'No data.'}\n"
+            f"Bus factor risks (pods with 1 contributor): {high_risk or 'None.'}\n"
+            f"In 2 sentences: (1) highest institutional knowledge risk, "
+            f"(2) one specific knowledge transfer recommendation."
+        )
+        try:
+            ai_summary = await chat(user_message=prompt, max_tokens=150)
+        except Exception:
+            ai_summary = (
+                f"Single-contributor pods ({high_risk or 'none'}) represent the highest bus-factor risk. "
+                f"Schedule pair-programming sessions with {expertise_map[0]['name']} to distribute critical knowledge."
+            )
+
+    return {
+        "expertise_map":    expertise_map[:10],
+        "bus_factor_risks": bus_factor_risks,
+        "ai_summary":       ai_summary,
+    }
 
     return {"insight": insight}

@@ -28,6 +28,7 @@ import uuid
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db, SessionLocal
@@ -124,6 +125,7 @@ def _to_out(t: JiraTicket) -> dict:
         "labels":         t.labels or [],
         "sprint_id":      t.sprint_id,
         "due_date":       t.due_date.isoformat() if t.due_date else None,
+        "custom_fields":  t.custom_fields,
         "hours_spent":    t.hours_spent or 0,
         "original_estimate_hours": t.original_estimate_hours or 0,
         "remaining_estimate_hours": t.remaining_estimate_hours or 0,
@@ -206,7 +208,7 @@ async def ai_analyze(
 ):
     """Analyse plain-English text with NOVA — returns structured fields + duplicate check."""
     from app.ai.ticket_intelligence import full_analysis
-    result = await full_analysis(body.text, user.org_id)
+    result = await full_analysis(body.text, user.org_id, body.available_users)
     return AIAnalyzeOut(
         fields=result.get("fields", {}),
         duplicates=result.get("duplicates", []),
@@ -264,6 +266,10 @@ async def create_ticket(
     _write_audit(db, ticket.id, user.org_id, user.id, "created", {"summary": body.summary})
     db.commit()
     db.refresh(ticket)
+
+    # Automation hook
+    from app.services.automation_engine import run_automations
+    await run_automations("ticket_created", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key}, user.org_id, ticket.pod or "", db)
 
     background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "")
     return TicketOut(**_to_out(ticket))
@@ -339,6 +345,13 @@ async def update_ticket(
         # For date fields, compare as strings to avoid type mismatch
         old_cmp = old_val.isoformat() if hasattr(old_val, "isoformat") else old_val
         new_cmp = value.isoformat() if hasattr(value, "isoformat") else value
+        # For JSONB custom_fields, merge instead of replace
+        if field == "custom_fields" and old_val and new_cmp:
+            merged = {**old_val, **new_cmp}
+            if merged != old_val:
+                diff[field] = {"old": old_val, "new": merged}
+                ticket.custom_fields = merged
+            continue
         if old_cmp != new_cmp:
             diff[field] = {"old": old_cmp, "new": new_cmp}
             setattr(ticket, field, value)
@@ -386,6 +399,9 @@ async def transition_status(
     })
     db.commit()
     db.refresh(ticket)
+    # Automation hook
+    from app.services.automation_engine import run_automations
+    await run_automations("status_change", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key, "old_status": old_status, "new_status": body.status}, user.org_id, ticket.pod or "", db)
     return TicketOut(**_to_out(ticket))
 
 
@@ -414,6 +430,9 @@ async def transition_status_by_key(
     })
     db.commit()
     db.refresh(ticket)
+    # Automation hook
+    from app.services.automation_engine import run_automations
+    await run_automations("status_change", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key, "old_status": old_status, "new_status": body.status}, user.org_id, ticket.pod or "", db)
     return TicketOut(**_to_out(ticket))
 
 
@@ -780,6 +799,117 @@ async def remove_link(
     if not link:
         raise HTTPException(404, "Link not found")
     db.delete(link)
+    db.commit()
+
+
+# ── EPIC LINK ─────────────────────────────────────────────────────────────────
+
+class EpicLinkPayload(BaseModel):
+    epic_id: Optional[str] = None
+
+
+@router.post("/{ticket_id}/epic", response_model=TicketOut)
+async def link_ticket_to_epic(
+    ticket_id: str,
+    body: EpicLinkPayload,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
+    ticket.epic_id = body.epic_id
+    _write_audit(db, ticket.id, user.org_id, user.id, "epic_linked", {"epic_id": body.epic_id})
+    db.commit()
+    db.refresh(ticket)
+    return TicketOut(**_to_out(ticket))
+
+
+# ── SUB-TASKS ─────────────────────────────────────────────────────────────────
+
+class SubtaskCreate(BaseModel):
+    summary: str
+    assignee: Optional[str] = None
+    story_points: Optional[int] = None
+
+
+@router.get("/{ticket_id}/subtasks", response_model=List[TicketOut])
+async def list_subtasks(
+    ticket_id: str,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
+    children = db.query(JiraTicket).filter(
+        JiraTicket.parent_id == ticket.id,
+        JiraTicket.org_id == user.org_id,
+        JiraTicket.is_deleted == False,
+    ).all()
+    return [TicketOut(**_to_out(t)) for t in children]
+
+
+@router.post("/{ticket_id}/subtasks", response_model=TicketOut, status_code=201)
+async def create_subtask(
+    ticket_id: str,
+    body: SubtaskCreate,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    parent = _resolve_ticket(db, user.org_id, ticket_id)
+    if not parent:
+        raise HTTPException(404, "Ticket not found")
+
+    from app.models.base import gen_uuid
+    sub = JiraTicket(
+        id=gen_uuid(),
+        org_id=user.org_id,
+        jira_key=_next_jira_key(db, user.org_id),
+        project_key=parent.project_key,
+        summary=body.summary,
+        issue_type="Subtask",
+        priority=parent.priority,
+        status="To Do",
+        pod=parent.pod,
+        client=parent.client,
+        assignee=body.assignee,
+        reporter=user.name,
+        story_points=body.story_points,
+        parent_id=parent.id,
+        is_deleted=False,
+    )
+    db.add(sub)
+    _write_audit(db, parent.id, user.org_id, user.id, "subtask_created", {"child_key": sub.jira_key, "summary": body.summary})
+    db.commit()
+    db.refresh(sub)
+    return TicketOut(**_to_out(sub))
+
+
+@router.delete("/{ticket_id}/subtasks/{child_key}", status_code=204)
+async def unlink_subtask(
+    ticket_id: str,
+    child_key: str,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    parent = _resolve_ticket(db, user.org_id, ticket_id)
+    if not parent:
+        raise HTTPException(404, "Ticket not found")
+
+    child = db.query(JiraTicket).filter(
+        JiraTicket.jira_key == child_key,
+        JiraTicket.org_id == user.org_id,
+        JiraTicket.parent_id == parent.id,
+        JiraTicket.is_deleted == False,
+    ).first()
+    if not child:
+        raise HTTPException(404, "Sub-task not found")
+
+    child.parent_id = None
+    _write_audit(db, parent.id, user.org_id, user.id, "subtask_unlinked", {"child_key": child_key})
     db.commit()
 
 

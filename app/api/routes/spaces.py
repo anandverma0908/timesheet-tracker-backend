@@ -16,7 +16,7 @@ Endpoints:
   DELETE /api/spaces/{pod}/members/{uid}   Remove a member from a space
 """
 
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -847,3 +847,395 @@ async def delete_space(
 
     db.commit()
     return {"pod": pod, "status": "deleted"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Reports
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/{pod}/reports/burndown")
+async def get_burndown_report(
+    pod: str,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    Burndown for the active sprint in this pod.
+    Returns daily remaining story points vs ideal line.
+    """
+    from app.models.sprint import Sprint
+    from app.models.ticket import JiraTicket
+    from app.models.audit import AuditLog
+    from datetime import datetime
+
+    org_id = user.org_id
+    sprint = db.query(Sprint).filter(
+        Sprint.org_id == org_id,
+        Sprint.pod == pod,
+        Sprint.status == "active",
+    ).order_by(Sprint.start_date.desc()).first()
+
+    if not sprint or not sprint.start_date or not sprint.end_date:
+        return {"sprint": None, "data": []}
+
+    tickets = db.query(JiraTicket).filter(
+        JiraTicket.sprint_id == sprint.id,
+        JiraTicket.is_deleted == False,
+    ).all()
+
+    total_pts = sum((t.story_points or 0) for t in tickets)
+    ticket_ids = [t.id for t in tickets]
+
+    # Find done transitions from audit log
+    done_audits = db.query(AuditLog).filter(
+        AuditLog.org_id == org_id,
+        AuditLog.entity_type == "ticket",
+        AuditLog.entity_id.in_(ticket_ids),
+        AuditLog.action == "status_changed",
+    ).order_by(AuditLog.created_at).all()
+
+    done_map = {}  # ticket_id -> date_str when transitioned to Done
+    for a in done_audits:
+        diff = a.diff_json or {}
+        if diff.get("new") in ("Done", "Closed", "Resolved"):
+            d = a.created_at.date().isoformat()
+            done_map[str(a.entity_id)] = d
+
+    start = sprint.start_date
+    end = sprint.end_date
+    total_days = max(1, (end - start).days)
+    today = date.today()
+    days = []
+    for i in range(total_days + 1):
+        d = start + timedelta(days=i)
+        if d > today:
+            break
+        days.append(d)
+
+    data = []
+    for d in days:
+        ds = d.isoformat()
+        done_pts = sum(
+            (t.story_points or 0)
+            for t in tickets
+            if done_map.get(str(t.id), "9999-99-99") <= ds
+        )
+        remaining = total_pts - done_pts
+        ideal = total_pts * (1 - (d - start).days / total_days)
+        data.append({"date": ds, "remaining": remaining, "ideal": round(ideal, 1)})
+
+    return {"sprint": {"id": sprint.id, "name": sprint.name, "total_points": total_pts}, "data": data}
+
+
+@router.get("/{pod}/reports/velocity")
+async def get_velocity_report(
+    pod: str,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    Velocity for the last 8 completed sprints in this pod.
+    """
+    from app.models.sprint import Sprint
+    from app.models.ticket import JiraTicket
+
+    org_id = user.org_id
+    sprints = db.query(Sprint).filter(
+        Sprint.org_id == org_id,
+        Sprint.pod == pod,
+        Sprint.status == "completed",
+    ).order_by(Sprint.end_date.desc()).limit(8).all()
+
+    result = []
+    for sp in reversed(sprints):
+        tickets = db.query(JiraTicket).filter(
+            JiraTicket.sprint_id == sp.id,
+            JiraTicket.is_deleted == False,
+        ).all()
+        committed = sum((t.story_points or 0) for t in tickets)
+        completed = sum((t.story_points or 0) for t in tickets if _normalize_status(t.status) == "Done")
+        result.append({
+            "sprint": sp.name,
+            "committed": committed,
+            "completed": completed,
+            "start_date": sp.start_date.isoformat() if sp.start_date else "",
+            "end_date": sp.end_date.isoformat() if sp.end_date else "",
+        })
+    return result
+
+
+@router.get("/{pod}/reports/cfd")
+async def get_cfd_report(
+    pod: str,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    Cumulative Flow Diagram for the last 30 days.
+    Returns daily ticket counts by status.
+    """
+    from app.models.ticket import JiraTicket
+    from app.models.audit import AuditLog
+    from datetime import datetime
+
+    org_id = user.org_id
+    today = date.today()
+    start_date = today - timedelta(days=29)
+
+    tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id == org_id,
+        JiraTicket.pod == pod,
+        JiraTicket.is_deleted == False,
+    ).all()
+
+    ticket_ids = [t.id for t in tickets]
+
+    # Get all status change audits for these tickets in the window
+    audits = db.query(AuditLog).filter(
+        AuditLog.org_id == org_id,
+        AuditLog.entity_type == "ticket",
+        AuditLog.entity_id.in_(ticket_ids),
+        AuditLog.action == "status_changed",
+        AuditLog.created_at >= datetime.combine(start_date, datetime.min.time()),
+    ).order_by(AuditLog.created_at).all()
+
+    # Build a history map: ticket_id -> list of (date, status)
+    history = {}
+    for t in tickets:
+        history[str(t.id)] = [(start_date, _normalize_status(t.status))]
+
+    for a in audits:
+        diff = a.diff_json or {}
+        new_status = _normalize_status(diff.get("new"))
+        d = a.created_at.date()
+        tid = str(a.entity_id)
+        if tid in history:
+            history[tid].append((d, new_status))
+            history[tid].sort(key=lambda x: x[0])
+
+    # For each day, determine status of each ticket
+    statuses = ["To Do", "In Progress", "In Review", "Blocked", "Done"]
+    data = []
+    for i in range(30):
+        d = start_date + timedelta(days=i)
+        counts = {s: 0 for s in statuses}
+        for tid, events in history.items():
+            # find most recent status on or before d
+            current = events[0][1]
+            for ed, es in events:
+                if ed <= d:
+                    current = es
+                else:
+                    break
+            if current in counts:
+                counts[current] += 1
+        row = {"date": d.isoformat()}
+        for s in statuses:
+            row[s] = counts[s]
+        data.append(row)
+
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Epic CRUD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class EpicCreatePayload(BaseModel):
+    title: str
+    color: Optional[str] = "#4F7EFF"
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
+
+class EpicUpdatePayload(BaseModel):
+    title: Optional[str] = None
+    color: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
+
+@router.post("/{pod}/epics")
+async def create_epic(
+    pod: str,
+    payload: EpicCreatePayload,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    from app.models.epic import Epic
+    from app.models.base import gen_uuid
+    from datetime import datetime
+
+    epic = Epic(
+        id=gen_uuid(),
+        org_id=user.org_id,
+        pod=pod,
+        title=payload.title,
+        color=payload.color,
+        start_date=datetime.strptime(payload.start_date, "%Y-%m-%d").date() if payload.start_date else None,
+        end_date=datetime.strptime(payload.end_date, "%Y-%m-%d").date() if payload.end_date else None,
+        progress=0,
+        task_count=0,
+        completed_count=0,
+    )
+    db.add(epic)
+    db.commit()
+    db.refresh(epic)
+    return {
+        "id": epic.id,
+        "title": epic.title,
+        "color": epic.color or "#4F7EFF",
+        "startDate": epic.start_date.isoformat() if epic.start_date else "",
+        "endDate": epic.end_date.isoformat() if epic.end_date else "",
+        "progress": epic.progress or 0,
+        "tasks": epic.task_count or 0,
+        "completed": epic.completed_count or 0,
+    }
+
+
+@router.put("/{pod}/epics/{epic_id}")
+async def update_epic(
+    pod: str,
+    epic_id: str,
+    payload: EpicUpdatePayload,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    from app.models.epic import Epic
+    from datetime import datetime
+
+    epic = db.query(Epic).filter(
+        Epic.id == epic_id,
+        Epic.org_id == user.org_id,
+        Epic.pod == pod,
+    ).first()
+    if not epic:
+        raise HTTPException(404, "Epic not found")
+
+    if payload.title is not None:
+        epic.title = payload.title
+    if payload.color is not None:
+        epic.color = payload.color
+    if payload.start_date is not None:
+        epic.start_date = datetime.strptime(payload.start_date, "%Y-%m-%d").date()
+    if payload.end_date is not None:
+        epic.end_date = datetime.strptime(payload.end_date, "%Y-%m-%d").date()
+
+    db.commit()
+    db.refresh(epic)
+    return {
+        "id": epic.id,
+        "title": epic.title,
+        "color": epic.color or "#4F7EFF",
+        "startDate": epic.start_date.isoformat() if epic.start_date else "",
+        "endDate": epic.end_date.isoformat() if epic.end_date else "",
+        "progress": epic.progress or 0,
+        "tasks": epic.task_count or 0,
+        "completed": epic.completed_count or 0,
+    }
+
+
+@router.delete("/{pod}/epics/{epic_id}", status_code=204)
+async def delete_epic(
+    pod: str,
+    epic_id: str,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    from app.models.epic import Epic
+    from app.models.ticket import JiraTicket
+
+    epic = db.query(Epic).filter(
+        Epic.id == epic_id,
+        Epic.org_id == user.org_id,
+        Epic.pod == pod,
+    ).first()
+    if not epic:
+        raise HTTPException(404, "Epic not found")
+
+    # Unlink tickets
+    db.query(JiraTicket).filter(
+        JiraTicket.epic_id == epic_id,
+    ).update({"epic_id": None}, synchronize_session=False)
+
+    db.delete(epic)
+    db.commit()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Board Config
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class BoardConfigPayload(BaseModel):
+    columns: list
+    swimlane_by: Optional[str] = None
+    wip_limits: dict = {}
+
+
+@router.get("/{pod}/board-config")
+async def get_board_config(
+    pod: str,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    from app.models.board_config import BoardConfig
+    config = db.query(BoardConfig).filter(
+        BoardConfig.org_id == user.org_id,
+        BoardConfig.pod == pod,
+    ).first()
+    if not config:
+        return {
+            "columns": [
+                {"id": "todo", "name": "To Do", "status_mapping": ["To Do"]},
+                {"id": "in_progress", "name": "In Progress", "status_mapping": ["In Progress"]},
+                {"id": "in_review", "name": "In Review", "status_mapping": ["In Review"]},
+                {"id": "blocked", "name": "Blocked", "status_mapping": ["Blocked"]},
+                {"id": "done", "name": "Done", "status_mapping": ["Done"]},
+            ],
+            "swimlane_by": "none",
+            "wip_limits": {},
+        }
+    return {
+        "columns": config.columns or [],
+        "swimlane_by": config.swimlane_by or "none",
+        "wip_limits": config.wip_limits or {},
+    }
+
+
+@router.put("/{pod}/board-config")
+async def update_board_config(
+    pod: str,
+    payload: BoardConfigPayload,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    from app.models.board_config import BoardConfig
+    from app.models.base import gen_uuid
+
+    config = db.query(BoardConfig).filter(
+        BoardConfig.org_id == user.org_id,
+        BoardConfig.pod == pod,
+    ).first()
+
+    if config:
+        config.columns = payload.columns
+        config.swimlane_by = payload.swimlane_by
+        config.wip_limits = payload.wip_limits
+    else:
+        config = BoardConfig(
+            id=gen_uuid(),
+            org_id=user.org_id,
+            pod=pod,
+            columns=payload.columns,
+            swimlane_by=payload.swimlane_by,
+            wip_limits=payload.wip_limits,
+        )
+        db.add(config)
+
+    db.commit()
+    db.refresh(config)
+    return {
+        "columns": config.columns or [],
+        "swimlane_by": config.swimlane_by or "none",
+        "wip_limits": config.wip_limits or {},
+    }

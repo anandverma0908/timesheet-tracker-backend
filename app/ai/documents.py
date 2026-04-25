@@ -155,11 +155,26 @@ async def generate_standup(user_id: str, org_id: str, standup_date: str, db) -> 
     if yesterday_dt.weekday() >= 5:
         yesterday_dt -= timedelta(days=yesterday_dt.weekday() - 4)
 
-    # Yesterday's worklogs
-    yesterday_logs = db.query(Worklog).filter(
-        Worklog.author_email == user.email,
-        Worklog.log_date     == yesterday_dt,
-    ).all()
+    # Yesterday's worklogs joined with their ticket for the ticket key + summary
+    yesterday_logs = (
+        db.query(Worklog, JiraTicket)
+        .join(JiraTicket, Worklog.ticket_id == JiraTicket.id)
+        .filter(
+            Worklog.author_email == user.email,
+            Worklog.log_date     == yesterday_dt,
+        )
+        .all()
+    )
+
+    # Recently completed tickets assigned to the user (Done/Closed in last 3 days)
+    recent_cutoff = today_dt - timedelta(days=3)
+    completed_tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id     == org_id,
+        JiraTicket.assignee   == user.name,
+        JiraTicket.status.in_(["Done", "Closed", "Resolved"]),
+        JiraTicket.is_deleted   == False,
+        JiraTicket.jira_updated >= recent_cutoff,
+    ).order_by(JiraTicket.jira_updated.desc()).limit(5).all()
 
     # Today's in-progress tickets (assigned to user)
     today_tickets = db.query(JiraTicket).filter(
@@ -169,9 +184,19 @@ async def generate_standup(user_id: str, org_id: str, standup_date: str, db) -> 
         JiraTicket.is_deleted    == False,
     ).limit(5).all()
 
-    yesterday_summary = "\n".join(
-        f"- {wl.hours}h on {wl.comment or 'work'}" for wl in yesterday_logs
-    ) or "No worklogs found for yesterday."
+    # Build yesterday summary — prefer ticket keys from worklogs + completed tickets
+    seen_keys: set = set()
+    yesterday_lines = []
+    for wl, ticket in yesterday_logs:
+        if ticket.jira_key not in seen_keys:
+            seen_keys.add(ticket.jira_key)
+            action = "Worked on" if ticket.status not in ("Done", "Closed", "Resolved") else "Completed"
+            yesterday_lines.append(f"- {action} {ticket.jira_key}: {ticket.summary} ({wl.hours}h)")
+    for t in completed_tickets:
+        if t.jira_key not in seen_keys:
+            seen_keys.add(t.jira_key)
+            yesterday_lines.append(f"- Completed {t.jira_key}: {t.summary}")
+    yesterday_summary = "\n".join(yesterday_lines) or "No logged work found for yesterday."
 
     today_summary = "\n".join(
         f"- {t.jira_key}: {t.summary}" for t in today_tickets
@@ -179,15 +204,15 @@ async def generate_standup(user_id: str, org_id: str, standup_date: str, db) -> 
 
     prompt = f"""Generate a daily standup for {user.name} ({user.role}, {user.pod or 'no pod'}).
 
-Yesterday's work:
+Yesterday's completed/in-progress work (use these EXACT ticket keys in your output):
 {yesterday_summary}
 
-Today's active tickets:
+Today's active tickets (use these EXACT ticket keys):
 {today_summary}
 
-Write a natural, first-person standup update:
-**Yesterday:** (what they did)
-**Today:** (what they plan to do)
+Write a natural, first-person standup update. Reference ticket keys (e.g. "Completed TRKLY-4 — fixed login screen").
+**Yesterday:** (what they did, with ticket keys)
+**Today:** (what they plan to do, with ticket keys)
 **Blockers:** (any blockers or 'None')
 
 Be concise — 2-3 bullet points per section max."""
@@ -230,12 +255,15 @@ Be concise — 2-3 bullet points per section max."""
     db.refresh(standup)
 
     return {
-        "id":        standup.id,
-        "user_id":   standup.user_id,
-        "user_name": user.name,
-        "date":      standup.date.isoformat(),
-        "yesterday": standup.yesterday,
-        "today":     standup.today,
-        "blockers":  standup.blockers,
-        "is_shared": standup.is_shared,
+        "id":             standup.id,
+        "user_id":        standup.user_id,
+        "engineer":       user.name,
+        "engineer_email": user.email,
+        "pod":            user.pod or "",
+        "date":           standup.date.isoformat(),
+        "yesterday":      standup.yesterday,
+        "today":          standup.today,
+        "blockers":       standup.blockers or "",
+        "shared":         standup.is_shared,
+        "created_at":     standup.date.isoformat(),
     }

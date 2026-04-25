@@ -7,14 +7,21 @@ Supports two inference providers, switchable via NOVA_PROVIDER env var:
 import httpx
 import logging
 from typing import Optional
-from sentence_transformers import SentenceTransformer, CrossEncoder
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = SentenceTransformer(settings.embedding_model)
-RERANKER_MODEL  = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+try:
+    from sentence_transformers import SentenceTransformer, CrossEncoder
+    EMBEDDING_MODEL = SentenceTransformer(settings.embedding_model)
+    RERANKER_MODEL  = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    _ST_AVAILABLE = True
+except Exception as _e:
+    logger.warning(f"sentence_transformers not available — embedding/rerank disabled: {_e}")
+    EMBEDDING_MODEL = None
+    RERANKER_MODEL  = None
+    _ST_AVAILABLE = False
 
 NOVA_SYSTEM_PROMPT = """You are NOVA, the built-in AI assistant for Trackly —
 a work management platform used by engineering and cross-functional teams at 3SC Solutions.
@@ -92,16 +99,22 @@ async def chat(
 
 
 def embed(text: str) -> list[float]:
+    if not _ST_AVAILABLE:
+        raise RuntimeError("sentence_transformers not installed — AI embeddings unavailable")
     return EMBEDDING_MODEL.encode(text, normalize_embeddings=True).tolist()
 
 
 def embed_batch(texts: list[str]) -> list[list[float]]:
+    if not _ST_AVAILABLE:
+        raise RuntimeError("sentence_transformers not installed — AI embeddings unavailable")
     return EMBEDDING_MODEL.encode(
         texts, normalize_embeddings=True, batch_size=32
     ).tolist()
 
 
 def rerank(query: str, documents: list[str], top_k: int = 5) -> list[int]:
+    if not _ST_AVAILABLE:
+        return list(range(min(top_k, len(documents))))
     pairs  = [(query, doc) for doc in documents]
     scores = RERANKER_MODEL.predict(pairs)
     ranked = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)

@@ -48,6 +48,7 @@ class TicketUpdate(BaseModel):
     labels:         Optional[List[str]] = None
     sprint_id:      Optional[str] = None
     due_date:       Optional[date] = None
+    custom_fields:  Optional[dict] = None
 
     @field_validator("due_date", mode="before")
     @classmethod
@@ -80,6 +81,7 @@ class TicketOut(BaseModel):
     labels:         Optional[List[str]] = None
     sprint_id:      Optional[str] = None
     due_date:       Optional[str] = None
+    custom_fields:  Optional[dict] = None
     is_deleted:     bool = False
     created_at:     Optional[datetime] = None
 
@@ -95,7 +97,8 @@ class NLCreateRequest(BaseModel):
 
 
 class AIAnalyzeRequest(BaseModel):
-    text: str
+    text:            str
+    available_users: List[str] = []
 
 
 class AIAnalyzeOut(BaseModel):

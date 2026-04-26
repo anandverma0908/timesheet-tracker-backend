@@ -26,3 +26,4 @@ from app.models.saved_filter import SavedFilter  # noqa: F401
 from app.models.board_config import BoardConfig  # noqa: F401
 from app.models.release import Release  # noqa: F401
 from app.models.automation import AutomationRule  # noqa: F401
+from app.models.tests import TestCase, TestCycle, TestExecution  # noqa: F401

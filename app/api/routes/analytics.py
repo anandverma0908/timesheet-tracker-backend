@@ -428,3 +428,386 @@ async def client_health(
         })
 
     return sorted(result, key=lambda x: x["health_score"])
+
+
+@router.get("/sentiment-signals")
+async def sentiment_signals(
+    db:   Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    Emotion-Aware Work Management: detect frustration/overload/disengagement
+    signals in ticket comments from the last 72 hours using NOVA AI.
+    Falls back to keyword scoring when NOVA is unavailable.
+    """
+    from datetime import datetime, timedelta
+    from app.models.ticket import TicketComment, JiraTicket
+    from app.models.user import User as UserModel
+    import asyncio, json as _json
+
+    org_id = user.org_id
+    cutoff = datetime.utcnow() - timedelta(hours=72)
+
+    rows = (
+        db.query(
+            UserModel.name.label("author_name"),
+            TicketComment.body,
+            JiraTicket.jira_key,
+            JiraTicket.sprint_id,
+        )
+        .join(JiraTicket, TicketComment.ticket_id == JiraTicket.id)
+        .join(UserModel, TicketComment.author_id == UserModel.id)
+        .filter(
+            JiraTicket.org_id == org_id,
+            JiraTicket.is_deleted == False,
+            TicketComment.is_deleted == False,
+            TicketComment.created_at >= cutoff,
+        )
+        .order_by(TicketComment.created_at.desc())
+        .limit(200)
+        .all()
+    )
+
+    if not rows:
+        return {"signals": [], "window_hours": 72}
+
+    # Group comments by author
+    author_map: dict = {}
+    for r in rows:
+        name = r.author_name or "Unknown"
+        if name not in author_map:
+            author_map[name] = {"comments": [], "tickets": []}
+        author_map[name]["comments"].append(r.body)
+        if r.jira_key not in author_map[name]["tickets"]:
+            author_map[name]["tickets"].append(r.jira_key)
+
+    # Build sprint label from sprint_id (best effort)
+    sprint_label = "Recent Sprint"
+
+    def _keyword_fallback(comments: list) -> Optional[dict]:
+        text = " ".join(comments).lower()
+        frustration_words = ["breaking", "again", "keeps", "same issue", "keeps failing", "still broken", "why is this", "ridiculous"]
+        overload_words    = ["too many", "overwhelmed", "not enough time", "too much", "can't keep up", "behind on", "swamped"]
+        disengagement_words = ["not sure why", "don't understand", "what's the point", "unclear", "no context"]
+
+        def score(words): return sum(1 for w in words if w in text)
+        scores = {
+            "Frustration":   score(frustration_words),
+            "Overload":      score(overload_words),
+            "Disengagement": score(disengagement_words),
+        }
+        best_signal, best_score = max(scores.items(), key=lambda x: x[1])
+        if best_score == 0:
+            return None
+
+        phrases = []
+        for phrase in frustration_words + overload_words + disengagement_words:
+            if phrase in text and len(phrases) < 2:
+                phrases.append(f"'{phrase}'")
+
+        return {
+            "signal": best_signal,
+            "severity": "high" if best_score >= 2 else "medium",
+            "phrases": phrases or [f"'{comments[0][:40]}…'"],
+        }
+
+    # Try NOVA AI analysis
+    signals = []
+    try:
+        from app.ai.nova import chat, is_available
+
+        if is_available():
+            comment_summary = "\n".join(
+                f"- {name}: {' | '.join(c[:100] for c in data['comments'][:3])}"
+                for name, data in list(author_map.items())[:10]
+            )
+            prompt = (
+                "You are an engineering team wellness AI. Analyze these recent ticket comments "
+                "and detect emotional signals: Frustration, Overload, or Disengagement.\n\n"
+                f"Comments (last 72h):\n{comment_summary}\n\n"
+                "Return JSON array only, no prose:\n"
+                '[{"engineer": "Name", "signal": "Frustration|Overload|Disengagement", '
+                '"severity": "high|medium", "phrases": ["quoted phrase 1", "quoted phrase 2"]}]\n'
+                "Only include engineers with clear signals. Max 5 results."
+            )
+            raw = await asyncio.wait_for(
+                chat(user_message=prompt, temperature=0, max_tokens=400),
+                timeout=12.0,
+            )
+            # Parse JSON from NOVA response
+            parsed = None
+            if raw:
+                import re as _re
+                for s, e in [("[", "]")]:
+                    start, end = raw.find(s), raw.rfind(e)
+                    if start != -1 and end > start:
+                        try:
+                            parsed = _json.loads(raw[start:end + 1])
+                            break
+                        except Exception:
+                            pass
+                if not parsed:
+                    m = _re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", raw)
+                    if m:
+                        try:
+                            parsed = _json.loads(m.group(1))
+                        except Exception:
+                            pass
+
+            if isinstance(parsed, list):
+                for item in parsed:
+                    if item.get("engineer") in author_map:
+                        signals.append({
+                            "engineer": item["engineer"],
+                            "signal": item.get("signal", "Unknown"),
+                            "phrases": item.get("phrases", []),
+                            "ticket_keys": author_map[item["engineer"]]["tickets"][:3],
+                            "severity": item.get("severity", "medium"),
+                            "sprint": sprint_label,
+                        })
+    except Exception:
+        pass
+
+    # Keyword fallback for any author not covered by NOVA
+    if not signals:
+        for name, data in list(author_map.items())[:8]:
+            result = _keyword_fallback(data["comments"])
+            if result:
+                signals.append({
+                    "engineer": name,
+                    **result,
+                    "ticket_keys": data["tickets"][:3],
+                    "sprint": sprint_label,
+                })
+
+    signals.sort(key=lambda x: 0 if x["severity"] == "high" else 1)
+    return {"signals": signals[:5], "window_hours": 72}
+
+
+@router.get("/benchmarks")
+async def benchmarks(
+    db:   Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    Real computed metrics compared against static industry benchmarks.
+    Metrics: sprint predictability, avg ticket resolution time, wiki coverage.
+    """
+    from app.models.sprint import Sprint, KnowledgeGap
+    from app.models.ticket import JiraTicket
+    from datetime import date
+
+    org_id = user.org_id
+    DONE   = {"Done", "Closed", "Resolved"}
+
+    # ── Sprint predictability ──────────────────────────────────────────────────
+    completed_sprints = (
+        db.query(Sprint)
+        .filter(Sprint.org_id == org_id, Sprint.status == "completed", Sprint.velocity != None)
+        .order_by(Sprint.end_date.desc())
+        .limit(20)
+        .all()
+    )
+    predictability = 0
+    if completed_sprints:
+        velocities = [s.velocity for s in completed_sprints if s.velocity]
+        if len(velocities) >= 2:
+            avg_v = sum(velocities) / len(velocities)
+            # A sprint is "predictable" if its velocity is within 20% of the rolling average
+            predictable = sum(1 for v in velocities if avg_v > 0 and abs(v - avg_v) / avg_v <= 0.20)
+            predictability = round((predictable / len(velocities)) * 100)
+        else:
+            predictability = 100 if velocities else 0
+
+    # ── Avg ticket resolution time (days) ─────────────────────────────────────
+    resolved = (
+        db.query(JiraTicket)
+        .filter(
+            JiraTicket.org_id == org_id,
+            JiraTicket.is_deleted == False,
+            JiraTicket.status.in_(list(DONE)),
+            JiraTicket.jira_created != None,
+            JiraTicket.jira_updated != None,
+        )
+        .limit(500)
+        .all()
+    )
+    avg_resolution_days = 0.0
+    if resolved:
+        deltas = [
+            (t.jira_updated - t.jira_created).days
+            for t in resolved
+            if t.jira_updated >= t.jira_created
+        ]
+        avg_resolution_days = round(sum(deltas) / max(1, len(deltas)), 1) if deltas else 0.0
+
+    # ── Wiki coverage ──────────────────────────────────────────────────────────
+    gaps = db.query(KnowledgeGap).filter(KnowledgeGap.org_id == org_id).all()
+    avg_wiki_coverage = round(sum(g.wiki_coverage for g in gaps) / max(1, len(gaps))) if gaps else 0
+
+    return [
+        {
+            "metric": "Sprint predictability",
+            "your_value": f"{predictability}%",
+            "industry_avg": "68%",
+            "similar_teams": "79%",
+            "direction": "up",
+            "insight": (
+                "Your sprint velocity is highly consistent — keep it up."
+                if predictability >= 75
+                else "Teams that adopt sprint scope freeze policies improve predictability by ~34%."
+            ),
+        },
+        {
+            "metric": "Avg ticket resolution time",
+            "your_value": f"{avg_resolution_days}d",
+            "industry_avg": "4.1d",
+            "similar_teams": "2.8d",
+            "direction": "down",
+            "insight": (
+                f"Your {avg_resolution_days}d resolution time is better than the 4.1d industry average."
+                if avg_resolution_days < 4.1 and avg_resolution_days > 0
+                else "Dedicated triage rotations help similar-stage teams reach 2.8d resolution time."
+            ),
+        },
+        {
+            "metric": "Knowledge coverage",
+            "your_value": f"{avg_wiki_coverage}%",
+            "industry_avg": "48%",
+            "similar_teams": "71%",
+            "direction": "up",
+            "insight": (
+                "Strong wiki coverage — above industry average."
+                if avg_wiki_coverage >= 48
+                else "Teams with weekly doc-review rituals reach 71% wiki coverage within 6 months."
+            ),
+        },
+    ]
+
+
+@router.get("/resource-gaps")
+async def resource_gaps(
+    db:   Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    Predictive Resource Planning: use NOVA AI to identify skill/hiring gaps
+    based on open high-priority tickets and team composition.
+    Falls back to rule-based analysis when NOVA is unavailable.
+    """
+    from app.models.ticket import JiraTicket
+    from app.models.user import User as UserModel
+    import asyncio, json as _json
+
+    org_id = user.org_id
+    DONE   = {"Done", "Closed", "Resolved"}
+
+    # Team composition
+    members = (
+        db.query(UserModel)
+        .filter(UserModel.org_id == org_id, UserModel.status == "active")
+        .all()
+    )
+    team_summary = ", ".join(
+        f"{m.name} ({m.role or 'member'}, pod={m.pod or 'N/A'})"
+        for m in members[:20]
+    )
+
+    # Open high-priority tickets
+    high_prio = (
+        db.query(JiraTicket)
+        .filter(
+            JiraTicket.org_id == org_id,
+            JiraTicket.is_deleted == False,
+            JiraTicket.priority.in_(["High", "Highest", "Critical"]),
+            JiraTicket.status.notin_(list(DONE)),
+        )
+        .order_by(JiraTicket.jira_created.desc())
+        .limit(50)
+        .all()
+    )
+    ticket_ctx = "\n".join(
+        f"- [{t.jira_key}] {t.summary[:80]} (pod={t.pod or 'N/A'}, type={t.issue_type})"
+        for t in high_prio[:30]
+    )
+
+    # Pod distribution
+    pod_counts: dict = {}
+    for t in high_prio:
+        pod = t.pod or "Unknown"
+        pod_counts[pod] = pod_counts.get(pod, 0) + 1
+
+    def _rule_based_gaps(tickets: list, members: list) -> list:
+        """Simple rule-based fallback."""
+        gaps = []
+        pods_with_load = sorted(pod_counts.items(), key=lambda x: x[1], reverse=True)
+        for pod, count in pods_with_load[:3]:
+            pod_members = [m for m in members if m.pod == pod]
+            if count > 5 and len(pod_members) < 3:
+                gaps.append({
+                    "goal": f"Clear {count} high-priority tickets in {pod}",
+                    "skill": f"Engineer ({pod})",
+                    "urgency": "high" if count > 8 else "medium",
+                    "needed_by": "Next quarter",
+                    "note": f"{pod} has {count} high-priority open items but only {len(pod_members)} active engineers.",
+                })
+        return gaps[:3]
+
+    gaps = []
+    try:
+        from app.ai.nova import chat, is_available
+
+        if is_available() and ticket_ctx:
+            prompt = (
+                "You are a resource planning AI for an engineering team. "
+                "Based on the open high-priority tickets and current team, identify skill or hiring gaps.\n\n"
+                f"Current team ({len(members)} members): {team_summary}\n\n"
+                f"High-priority open tickets:\n{ticket_ctx}\n\n"
+                "Return JSON array only, no prose:\n"
+                '[{"goal": "short goal description", "skill": "role/skill needed", '
+                '"urgency": "high|medium", "needed_by": "e.g. Q3 2026", '
+                '"note": "1-2 sentence explanation"}]\n'
+                "Max 3 gaps. Only return gaps that are clearly supported by the data."
+            )
+            raw = await asyncio.wait_for(
+                chat(user_message=prompt, temperature=0, max_tokens=500),
+                timeout=14.0,
+            )
+            if raw:
+                import re as _re
+                for s, e in [("[", "]")]:
+                    start, end = raw.find(s), raw.rfind(e)
+                    if start != -1 and end > start:
+                        try:
+                            parsed = _json.loads(raw[start:end + 1])
+                            if isinstance(parsed, list):
+                                gaps = [
+                                    {
+                                        "goal":      item.get("goal", ""),
+                                        "skill":     item.get("skill", ""),
+                                        "urgency":   item.get("urgency", "medium"),
+                                        "needed_by": item.get("needed_by", "Next quarter"),
+                                        "note":      item.get("note", ""),
+                                    }
+                                    for item in parsed
+                                    if item.get("skill")
+                                ][:3]
+                            break
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    if not gaps:
+        gaps = _rule_based_gaps(high_prio, members)
+
+    total_gap_count = len(gaps)
+    return {
+        "gaps": gaps,
+        "total_open_high_priority": len(high_prio),
+        "team_size": len(members),
+        "forecast_note": (
+            f"EOS forecasts {total_gap_count} skill gap(s) based on {len(high_prio)} "
+            f"high-priority open tickets across your {len(members)}-person team."
+        ),
+    }

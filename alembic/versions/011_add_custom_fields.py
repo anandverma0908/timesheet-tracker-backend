@@ -1,7 +1,7 @@
 """011_add_custom_fields
 
 Revision ID: 011_add_custom_fields
-Revises: 010_add_parent_id_to_jira_tickets
+Revises: 010_add_parent_id
 Create Date: 2026-04-25 15:00:00.000000
 
 """
@@ -11,7 +11,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision = '011_add_custom_fields'
-down_revision = '010_add_parent_id_to_jira_tickets'
+down_revision = '010_add_parent_id'
 branch_labels = None
 depends_on = None
 

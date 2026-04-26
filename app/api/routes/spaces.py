@@ -19,7 +19,7 @@ Endpoints:
 from datetime import date, timedelta, datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import func
@@ -495,6 +495,7 @@ async def get_space_project(
                     "labels": t.labels or [],
                     "sprint": sp.id,
                     "epicId": t.epic_id,
+                    "parentId": t.parent_id,
                     "pod": t.pod,
                 }
                 for idx, t in enumerate(sp_tickets)
@@ -1238,4 +1239,143 @@ async def update_board_config(
         "columns": config.columns or [],
         "swimlane_by": config.swimlane_by or "none",
         "wip_limits": config.wip_limits or {},
+    }
+
+
+@router.get("/{pod}/stories")
+async def get_pod_stories(
+    pod: str,
+    sprint_id: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """
+    Stories in the active (or given) sprint for a pod.
+    Each story includes its child tasks, progress, and a rule-based EOS insight.
+    """
+    from app.models.ticket import JiraTicket
+    from app.models.sprint import Sprint
+    from datetime import date as _date
+
+    org_id = user.org_id
+    DONE = {"Done", "Closed", "Resolved"}
+
+    if sprint_id:
+        sprint = db.query(Sprint).filter(
+            Sprint.id == sprint_id, Sprint.org_id == org_id,
+        ).first()
+    else:
+        sprint = db.query(Sprint).filter(
+            Sprint.org_id == org_id, Sprint.pod == pod, Sprint.status == "active",
+        ).first()
+        if not sprint:
+            sprint = db.query(Sprint).filter(
+                Sprint.org_id == org_id, Sprint.pod == pod, Sprint.status == "planning",
+            ).order_by(Sprint.created_at.desc()).first()
+
+    if not sprint:
+        return {"stories": [], "sprint_id": None, "everything_else": {"totalTasks": 0, "doneTasks": 0, "tasks": []}}
+
+    sprint_tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id == org_id,
+        JiraTicket.sprint_id == sprint.id,
+        JiraTicket.is_deleted == False,
+    ).all()
+
+    stories = [t for t in sprint_tickets if (t.issue_type or "").lower() == "story"]
+    ticket_by_id = {t.id: t for t in sprint_tickets}
+    child_map: dict = {}
+    for t in sprint_tickets:
+        if t.parent_id and t.parent_id in ticket_by_id:
+            child_map.setdefault(t.parent_id, []).append(t)
+
+    today = _date.today()
+
+    def _eos_insight(story, children: list) -> dict:
+        total = len(children)
+        done_count = sum(1 for c in children if _normalize_status(c.status) == "Done")
+        blocked = sum(1 for c in children if _normalize_status(c.status) == "Blocked")
+        in_progress = sum(1 for c in children if _normalize_status(c.status) == "In Progress")
+        pct = round((done_count / total) * 100) if total > 0 else 0
+        stale_days = (today - story.jira_updated).days if story.jira_updated else 0
+        days_left = max(0, (sprint.end_date - today).days) if sprint.end_date else 7
+
+        if blocked > 0:
+            return {"label": "Blocked", "color": "red",
+                    "text": f"{blocked} task{'s' if blocked > 1 else ''} blocked — needs immediate attention."}
+        if total == 0:
+            return {"label": "No Tasks", "color": "amber", "text": "No tasks linked yet."}
+        if pct == 100:
+            return {"label": "Complete", "color": "green", "text": "All tasks done. Ready to close."}
+        if stale_days > 5 and pct < 50:
+            return {"label": "Stale", "color": "amber",
+                    "text": f"No activity for {stale_days}d and only {pct}% complete."}
+        if days_left <= 2 and pct < 70:
+            return {"label": "At Risk", "color": "red",
+                    "text": f"Only {pct}% done with {days_left}d left in sprint."}
+        if in_progress > 0 and pct >= 50:
+            return {"label": "On Track", "color": "green", "text": f"{pct}% complete — progressing well."}
+        return {"label": "In Progress", "color": "accent",
+                "text": f"{done_count}/{total} tasks done ({pct}%)."}
+
+    def _serialize_task(t) -> dict:
+        return {
+            "id": t.id, "key": t.jira_key, "title": t.summary,
+            "status": _normalize_status(t.status),
+            "priority": _normalize_priority(t.priority),
+            "type": _normalize_type(t.issue_type),
+            "assignee": t.assignee,
+            "assigneeInitials": _initials(t.assignee),
+            "assigneeColor": _hash_color(t.assignee or t.id),
+            "storyPoints": t.story_points or 0,
+            "dueDate": t.due_date.isoformat() if t.due_date else None,
+            "createdAt": t.jira_created.isoformat() if t.jira_created else "",
+            "updatedAt": t.jira_updated.isoformat() if t.jira_updated else "",
+            "description": t.description or "",
+            "labels": t.labels or [],
+            "sprint": sprint.id,
+            "epicId": t.epic_id,
+            "parentId": t.parent_id,
+            "pod": t.pod,
+        }
+
+    result = []
+    for story in stories:
+        children = child_map.get(story.id, [])
+        total = len(children)
+        done_count = sum(1 for c in children if _normalize_status(c.status) == "Done")
+        blocked = sum(1 for c in children if _normalize_status(c.status) == "Blocked")
+        pct = round((done_count / total) * 100) if total > 0 else 0
+        result.append({
+            "id": story.id, "key": story.jira_key, "title": story.summary,
+            "status": _normalize_status(story.status),
+            "priority": _normalize_priority(story.priority),
+            "assignee": story.assignee,
+            "assigneeInitials": _initials(story.assignee),
+            "assigneeColor": _hash_color(story.assignee or story.id),
+            "epicId": story.epic_id,
+            "storyPoints": story.story_points or 0,
+            "totalTasks": total, "doneTasks": done_count,
+            "blockedTasks": blocked, "progressPct": pct,
+            "eosInsight": _eos_insight(story, children),
+            "tasks": [_serialize_task(c) for c in children],
+        })
+
+    story_ids = {s.id for s in stories}
+    unlinked = [
+        t for t in sprint_tickets
+        if (t.issue_type or "").lower() != "story"
+        and (not t.parent_id or t.parent_id not in story_ids)
+    ]
+    unlinked_done = sum(1 for t in unlinked if _normalize_status(t.status) == "Done")
+
+    return {
+        "sprint_id": sprint.id,
+        "sprint_name": sprint.name,
+        "stories": result,
+        "everything_else": {
+            "totalTasks": len(unlinked),
+            "doneTasks": unlinked_done,
+            "tasks": [_serialize_task(t) for t in unlinked],
+        },
     }

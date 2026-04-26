@@ -181,6 +181,45 @@ async def delete_release(
     db.commit()
 
 
+@router.get("/{pod}/releases/{release_id}/tickets")
+async def list_release_tickets(
+    pod: str,
+    release_id: str,
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    r = db.query(Release).filter(
+        Release.id == release_id,
+        Release.org_id == user.org_id,
+        Release.pod == pod,
+    ).first()
+    if not r:
+        raise HTTPException(404, "Release not found")
+
+    tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id == user.org_id,
+        JiraTicket.pod == pod,
+        JiraTicket.fix_version == r.name,
+        JiraTicket.is_deleted == False,
+    ).order_by(JiraTicket.jira_key).all()
+
+    return [
+        {
+            "id": t.id,
+            "key": t.jira_key,
+            "summary": t.summary,
+            "status": t.status,
+            "priority": t.priority,
+            "issue_type": t.issue_type,
+            "assignee": t.assignee,
+            "assignee_email": t.assignee_email,
+            "story_points": t.story_points,
+            "url": t.url,
+        }
+        for t in tickets
+    ]
+
+
 @router.post("/tickets/{key}/fix-version")
 async def set_fix_version(
     key: str,

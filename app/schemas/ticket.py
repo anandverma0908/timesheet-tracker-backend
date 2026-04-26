@@ -19,6 +19,9 @@ class TicketCreate(BaseModel):
     sprint_id:      Optional[str] = None
     jira_key:       Optional[str] = None
     due_date:       Optional[date] = None
+    parent_key:     Optional[str] = None
+    epic_key:       Optional[str] = None
+    fix_version:    Optional[str] = None
 
     @field_validator("due_date", mode="before")
     @classmethod
@@ -49,6 +52,9 @@ class TicketUpdate(BaseModel):
     sprint_id:      Optional[str] = None
     due_date:       Optional[date] = None
     custom_fields:  Optional[dict] = None
+    parent_key:     Optional[str] = None
+    epic_key:       Optional[str] = None
+    fix_version:    Optional[str] = None
 
     @field_validator("due_date", mode="before")
     @classmethod
@@ -84,8 +90,11 @@ class TicketOut(BaseModel):
     custom_fields:  Optional[dict] = None
     is_deleted:     bool = False
     created_at:     Optional[datetime] = None
+    fix_version:    Optional[str] = None
+    parent_key:     Optional[str] = None
+    epic_key:       Optional[str] = None
 
-    model_config = {"from_attributes": True}
+    model_config = {"from_attributes": True, "populate_by_name": True}
 
 
 class StatusTransition(BaseModel):

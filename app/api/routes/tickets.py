@@ -101,9 +101,22 @@ def _attachment_url(filepath: str) -> str:
     return f"/uploads/{filename}"
 
 
-def _to_out(t: JiraTicket) -> dict:
+def _to_out(t: JiraTicket, db: Session = None) -> dict:
     created = t.jira_created.isoformat() if t.jira_created else (t.synced_at.isoformat() if t.synced_at else None)
     updated = t.jira_updated.isoformat() if t.jira_updated else (t.synced_at.isoformat() if t.synced_at else None)
+
+    parent_key = None
+    epic_key = None
+    if db is not None:
+        if t.parent_id:
+            parent = db.query(JiraTicket).filter(JiraTicket.id == t.parent_id).first()
+            if parent:
+                parent_key = parent.jira_key
+        if t.epic_id:
+            epic = db.query(JiraTicket).filter(JiraTicket.id == t.epic_id).first()
+            if epic:
+                epic_key = epic.jira_key
+
     return {
         "id":             t.id,
         "key":            t.jira_key,
@@ -135,6 +148,9 @@ def _to_out(t: JiraTicket) -> dict:
         "created_at":     t.synced_at,
         "created":        created,
         "updated":        updated,
+        "fix_version":    t.fix_version,
+        "parent_key":     parent_key,
+        "epic_key":       epic_key,
     }
 
 
@@ -241,6 +257,27 @@ async def create_ticket(
 ):
     from app.models.base import gen_uuid
     jira_key = body.jira_key or _next_jira_key(db, user.org_id)
+    # Resolve parent and epic by key
+    parent_id = None
+    if body.parent_key:
+        parent = db.query(JiraTicket).filter(
+            JiraTicket.jira_key == body.parent_key,
+            JiraTicket.org_id == user.org_id,
+            JiraTicket.is_deleted == False,
+        ).first()
+        if parent:
+            parent_id = parent.id
+
+    epic_id = None
+    if body.epic_key:
+        epic = db.query(JiraTicket).filter(
+            JiraTicket.jira_key == body.epic_key,
+            JiraTicket.org_id == user.org_id,
+            JiraTicket.is_deleted == False,
+        ).first()
+        if epic:
+            epic_id = epic.id
+
     ticket = JiraTicket(
         id=gen_uuid(),
         org_id=user.org_id,
@@ -260,6 +297,9 @@ async def create_ticket(
         labels=body.labels or [],
         sprint_id=body.sprint_id,
         due_date=body.due_date,
+        fix_version=body.fix_version,
+        parent_id=parent_id,
+        epic_id=epic_id,
         is_deleted=False,
     )
     db.add(ticket)
@@ -272,7 +312,7 @@ async def create_ticket(
     await run_automations("ticket_created", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key}, user.org_id, ticket.pod or "", db)
 
     background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "")
-    return TicketOut(**_to_out(ticket))
+    return TicketOut(**_to_out(ticket, db))
 
 
 # ── LIST ──────────────────────────────────────────────────────────────────────
@@ -324,7 +364,7 @@ async def get_ticket(
     ticket = _resolve_ticket(db, user.org_id, ticket_id)
     if not ticket:
         raise HTTPException(404, "Ticket not found")
-    return TicketOut(**_to_out(ticket))
+    return TicketOut(**_to_out(ticket, db))
 
 
 @router.put("/{ticket_id}", response_model=TicketOut)
@@ -339,8 +379,33 @@ async def update_ticket(
     if not ticket:
         raise HTTPException(404, "Ticket not found")
 
+    update_data = body.model_dump(exclude_none=True)
+
+    # Handle hierarchy key→id resolution outside the generic loop
+    if "parent_key" in update_data:
+        pk = update_data.pop("parent_key")
+        parent = db.query(JiraTicket).filter(
+            JiraTicket.jira_key == pk,
+            JiraTicket.org_id == user.org_id,
+            JiraTicket.is_deleted == False,
+        ).first() if pk else None
+        new_parent_id = parent.id if parent else None
+        if ticket.parent_id != new_parent_id:
+            update_data["parent_id"] = new_parent_id
+
+    if "epic_key" in update_data:
+        ek = update_data.pop("epic_key")
+        epic = db.query(JiraTicket).filter(
+            JiraTicket.jira_key == ek,
+            JiraTicket.org_id == user.org_id,
+            JiraTicket.is_deleted == False,
+        ).first() if ek else None
+        new_epic_id = epic.id if epic else None
+        if ticket.epic_id != new_epic_id:
+            update_data["epic_id"] = new_epic_id
+
     diff = {}
-    for field, value in body.model_dump(exclude_none=True).items():
+    for field, value in update_data.items():
         old_val = getattr(ticket, field, None)
         # For date fields, compare as strings to avoid type mismatch
         old_cmp = old_val.isoformat() if hasattr(old_val, "isoformat") else old_val
@@ -361,7 +426,7 @@ async def update_ticket(
         db.commit()
         db.refresh(ticket)
         background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "")
-    return TicketOut(**_to_out(ticket))
+    return TicketOut(**_to_out(ticket, db))
 
 
 @router.delete("/{ticket_id}", status_code=204)

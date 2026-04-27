@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     nova_temperature: float = 0.3
     nova_max_tokens: int = 1500
     embedding_model: str = "all-MiniLM-L6-v2"
+    vision_model:    str = "llava"             # Ollama vision model for screenshot analysis
 
     # ── Cerebras (cloud) ─────────────────────────────────────────────────────
     cerebras_api_key: str = ""

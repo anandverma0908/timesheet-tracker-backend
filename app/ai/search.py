@@ -7,6 +7,7 @@ so all vector casts use CAST(:param AS vector) instead of :param::vector.
 
 import re
 import logging
+from typing import Optional
 from sqlalchemy import text
 
 from app.ai.nova import embed, rerank, chat
@@ -21,19 +22,47 @@ Reference ticket keys (e.g. TRKLY-4) when relevant.
 If information is available in context, use it. If not, say so briefly and suggest next steps."""
 
 
-async def semantic_search(query: str, org_id: str, limit: int = 10) -> list[dict]:
-    query_emb = str(embed(query))
+SEMANTIC_THRESHOLD = 0.20  # minimum cosine similarity; all-MiniLM-L6-v2 scores are lower than intuition suggests
+
+async def semantic_search(
+    query: str,
+    org_id: str,
+    limit: int = 10,
+    allowed_emails: Optional[set] = None,
+    allowed_pods: Optional[set] = None,
+) -> list[dict]:
+    query_emb = str(embed(query))  # raises RuntimeError if sentence_transformers unavailable → 503
+
+    # Build optional visibility filters — either emails OR pods qualify (OR logic, same as list_tickets)
+    ticket_extra_sql = ""
+    ticket_params: dict = {"emb": query_emb, "org_id": org_id, "limit": limit, "threshold": SEMANTIC_THRESHOLD}
+
+    if allowed_emails is not None or allowed_pods is not None:
+        clauses = []
+        if allowed_emails:
+            placeholders = ", ".join(f":em_{i}" for i, _ in enumerate(allowed_emails))
+            clauses.append(f"t.assignee_email IN ({placeholders})")
+            ticket_params.update({f"em_{i}": e for i, e in enumerate(allowed_emails)})
+        if allowed_pods:
+            placeholders = ", ".join(f":pod_{i}" for i, _ in enumerate(allowed_pods))
+            clauses.append(f"t.pod IN ({placeholders})")
+            ticket_params.update({f"pod_{i}": p for i, p in enumerate(allowed_pods)})
+        if clauses:
+            ticket_extra_sql = " AND (" + " OR ".join(clauses) + ")"
+
     db = SessionLocal()
     try:
-        tickets = db.execute(text("""
+        tickets = db.execute(text(f"""
             SELECT t.id::text as id, 'ticket' as source_type, t.jira_key as key, t.summary as title,
                    te.content_snippet as snippet,
                    1 - (te.embedding <=> CAST(:emb AS vector)) as similarity
             FROM ticket_embeddings te
             JOIN jira_tickets t ON te.ticket_id = t.id
             WHERE t.org_id = :org_id AND t.is_deleted = false
+              AND 1 - (te.embedding <=> CAST(:emb AS vector)) >= :threshold
+              {ticket_extra_sql}
             ORDER BY te.embedding <=> CAST(:emb AS vector) LIMIT :limit
-        """), {"emb": query_emb, "org_id": org_id, "limit": limit}).fetchall()
+        """), ticket_params).fetchall()
 
         try:
             wiki = db.execute(text("""
@@ -43,8 +72,9 @@ async def semantic_search(query: str, org_id: str, limit: int = 10) -> list[dict
                 FROM wiki_embeddings we
                 JOIN wiki_pages wp ON we.page_id = wp.id
                 WHERE wp.org_id = :org_id AND wp.is_deleted = false
+                  AND 1 - (we.embedding <=> CAST(:emb AS vector)) >= :threshold
                 ORDER BY we.embedding <=> CAST(:emb AS vector) LIMIT :limit
-            """), {"emb": query_emb, "org_id": org_id, "limit": limit}).fetchall()
+            """), {"emb": query_emb, "org_id": org_id, "limit": limit, "threshold": SEMANTIC_THRESHOLD}).fetchall()
         except Exception:
             wiki = []
 
@@ -210,7 +240,7 @@ async def nl_query(query: str, org_id: str, user_context: str = "") -> dict:
 async def find_similar_tickets(
     embedding: list[float],
     org_id: str,
-    threshold: float = 0.72,
+    threshold: float = 0.58,
     limit: int = 3,
     query_text: str = "",
 ) -> list[dict]:
@@ -247,25 +277,6 @@ async def find_similar_tickets(
                 logger.info(f"find_similar_tickets: below-threshold candidate '{r.summary}' similarity={r.similarity:.3f}")
         except Exception:
             pass
-
-        # Keyword fallback — catches obvious title overlaps that fall below embedding threshold
-        if query_text:
-            words = [w for w in re.sub(r"[^a-z0-9 ]", "", query_text.lower()).split() if len(w) >= 4][:6]
-            if len(words) >= 2:
-                like_clauses = " AND ".join(f"LOWER(t.summary) LIKE :w{i}" for i in range(len(words)))
-                params: dict = {"org_id": org_id, "limit": limit}
-                params.update({f"w{i}": f"%{w}%" for i, w in enumerate(words)})
-                kw_rows = db.execute(text(f"""
-                    SELECT t.jira_key, t.summary, t.status, 0.65 as similarity
-                    FROM jira_tickets t
-                    WHERE t.org_id = :org_id AND t.is_deleted = false AND t.status != 'Done'
-                      AND {like_clauses}
-                    LIMIT :limit
-                """), params).fetchall()
-                kw_results = [dict(r._mapping) for r in kw_rows]
-                if kw_results:
-                    logger.info(f"find_similar_tickets: keyword fallback found {len(kw_results)} results")
-                return kw_results
 
         return []
     except Exception as e:

@@ -22,7 +22,8 @@ import hashlib
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -1756,3 +1757,83 @@ async def memory_graph(
     }
 
     return {"insight": insight}
+
+
+# ── Media-to-Ticket Endpoints ─────────────────────────────────────────────────
+
+class ImageAnalyzeRequest(BaseModel):
+    image:       str   # base64-encoded image (no data URI prefix)
+    description: str = ""
+
+
+@router.post("/analyze-image")
+async def analyze_image(
+    body: ImageAnalyzeRequest,
+    user: User = Depends(get_current_user),
+):
+    """
+    Analyze a screenshot using the llava vision model (Ollama).
+    Returns structured bug fields ready for ticket creation.
+    Requires: ollama pull llava
+    """
+    from app.ai.nova import analyze_image_with_llava
+    try:
+        result = await analyze_image_with_llava(body.image, body.description)
+        return result
+    except Exception as e:
+        raise HTTPException(503, f"Vision analysis unavailable: {e}")
+
+
+@router.post("/transcribe")
+async def transcribe_media(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    """
+    Transcribe an audio or video file using faster-whisper (local, no API key).
+    Then runs the transcript through the ticket intelligence pipeline.
+    Returns: {transcript, fields: {title, description, priority, issue_type, ...}}
+    Supports: mp3, wav, m4a, mp4, mov, avi, mkv, webm
+    """
+    from app.ai.media import process_media_file
+    from app.ai.ticket_intelligence import analyse_ticket
+
+    allowed_types = {
+        "audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/x-m4a",
+        "audio/ogg", "video/mp4", "video/quicktime", "video/x-msvideo",
+        "video/x-matroska", "video/webm",
+    }
+    ct = file.content_type or ""
+    filename = file.filename or "upload"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    allowed_exts = {"mp3", "wav", "m4a", "ogg", "mp4", "mov", "avi", "mkv", "webm"}
+
+    if ct not in allowed_types and ext not in allowed_exts:
+        raise HTTPException(400, f"Unsupported file type: {ct or ext}. Use audio or video files.")
+
+    max_bytes = 100 * 1024 * 1024  # 100 MB
+    content = await file.read()
+    if len(content) > max_bytes:
+        raise HTTPException(413, "File too large (max 100 MB)")
+
+    try:
+        media_result = await process_media_file(content, filename)
+        transcript   = media_result["transcript"]
+
+        if not transcript.strip():
+            raise HTTPException(422, "Could not extract speech from the file. Check that it contains clear audio.")
+
+        # Run ticket intelligence on the transcript
+        fields = await analyse_ticket(transcript, available_users=[])
+
+        return {
+            "transcript": transcript,
+            "fields":     fields,
+            "source":     filename,
+        }
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+    except Exception as e:
+        raise HTTPException(500, f"Transcription failed: {e}")

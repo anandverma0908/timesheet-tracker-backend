@@ -121,6 +121,53 @@ def rerank(query: str, documents: list[str], top_k: int = 5) -> list[int]:
     return ranked[:top_k]
 
 
+async def analyze_image_with_llava(base64_image: str, description: str = "") -> dict:
+    """
+    Send a screenshot to the llava vision model via Ollama.
+    Returns a structured dict: {title, description, repro_steps, severity, issue_type}.
+    """
+    import json as _json
+    import re as _re
+
+    desc_ctx = f'The user describes it as: "{description}".' if description.strip() else ""
+    prompt = (
+        f"You are a QA engineer. Analyze this screenshot for software bugs or UI issues. {desc_ctx}\n"
+        "Return ONLY valid JSON — no prose, no markdown:\n"
+        '{"title":"concise bug title","description":"what is wrong and why","'
+        'repro_steps":["step 1","step 2","step 3"],'
+        '"severity":"critical|high|medium|low","issue_type":"Bug|UI Bug|Performance|Crash"}'
+    )
+
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        resp = await client.post(
+            f"{settings.nova_base_url}/api/generate",
+            json={
+                "model":  settings.vision_model,
+                "prompt": prompt,
+                "images": [base64_image],
+                "stream": False,
+            },
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("response", "")
+
+    m = _re.search(r"\{[\s\S]*\}", raw)
+    if m:
+        try:
+            return _json.loads(m.group())
+        except Exception:
+            pass
+
+    # Fallback: use the raw text as description
+    return {
+        "title":       description[:80] if description else "Bug from screenshot",
+        "description": raw or "Screenshot analysed — no structured fields extracted.",
+        "repro_steps": [],
+        "severity":    "medium",
+        "issue_type":  "Bug",
+    }
+
+
 def is_available() -> bool:
     if settings.nova_provider == "cerebras":
         return bool(settings.cerebras_api_key)

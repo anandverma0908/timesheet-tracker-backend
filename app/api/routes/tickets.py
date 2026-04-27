@@ -32,7 +32,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db, SessionLocal
-from app.core.dependencies import get_current_user
+from app.core.dependencies import get_current_user, get_visibility_scope, VisibilityScope
 from app.core.config import settings
 from app.models.ticket import JiraTicket, TicketComment, TicketAttachment, TicketLink
 from app.models.audit import AuditLog
@@ -328,14 +328,28 @@ async def list_tickets(
     search:     Optional[str] = Query(None),
     limit:      int           = Query(50, le=200),
     offset:     int           = Query(0),
-    db:   Session = Depends(get_db),
-    user: User    = Depends(get_current_user),
+    db:      Session         = Depends(get_db),
+    user:    User            = Depends(get_current_user),
+    scope:   VisibilityScope = Depends(get_visibility_scope),
 ):
+    from sqlalchemy import or_
+
     effective_assignee = assignee or user_filter
     q = db.query(JiraTicket).filter(
         JiraTicket.org_id == user.org_id,
         JiraTicket.is_deleted == False,
     )
+
+    # Apply role-based visibility via VisibilityScope
+    if not scope.unrestricted:
+        conditions = []
+        if scope.allowed_pods:
+            conditions.append(JiraTicket.pod.in_(scope.allowed_pods))
+        if scope.allowed_emails:
+            conditions.append(JiraTicket.assignee_email.in_(scope.allowed_emails))
+        if conditions:
+            q = q.filter(or_(*conditions))
+
     if pod:                q = q.filter(JiraTicket.pod == pod)
     if status:             q = q.filter(JiraTicket.status == status)
     if effective_assignee: q = q.filter(JiraTicket.assignee.ilike(f"%{effective_assignee}%"))

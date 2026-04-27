@@ -24,6 +24,8 @@ from app.api.routes.releases      import router as releases_router
 from app.api.routes.automations   import router as automations_router
 from app.api.routes.custom_fields import router as custom_fields_router
 from app.api.routes.tests         import router as tests_router
+from app.api.routes.code_review    import router as code_review_router
+from app.api.routes.manual_entries import router as manual_entries_router
 
 api_router = APIRouter()
 
@@ -45,3 +47,5 @@ api_router.include_router(releases_router)
 api_router.include_router(automations_router)
 api_router.include_router(custom_fields_router)
 api_router.include_router(tests_router)
+api_router.include_router(code_review_router)
+api_router.include_router(manual_entries_router)

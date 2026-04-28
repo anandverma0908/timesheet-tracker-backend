@@ -2,6 +2,8 @@
 Jira Client — fetches tickets from ALL projects, with all clients and PODs
 """
 
+
+
 import requests
 from requests.auth import HTTPBasicAuth
 from collections import defaultdict

@@ -17,6 +17,7 @@ class SearchOut(BaseModel):
 class NovaQueryRequest(BaseModel):
     query: str
     scope: Optional[str] = "all"
+    pod:   Optional[str] = None
 
 
 class NovaQueryOut(BaseModel):

@@ -14,6 +14,7 @@ from datetime import date
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
@@ -51,24 +52,30 @@ async def list_releases(
         Release.pod == pod,
     ).order_by(Release.created_at.desc()).all()
 
-    result = []
-    for r in releases:
-        ticket_count = db.query(JiraTicket).filter(
-            JiraTicket.org_id == user.org_id,
-            JiraTicket.pod == pod,
-            JiraTicket.fix_version == r.name,
-            JiraTicket.is_deleted == False,
-        ).count()
-        result.append({
+    # Single aggregation query instead of N+1 per-release count
+    count_rows = db.query(
+        JiraTicket.fix_version,
+        func.count(JiraTicket.id).label("cnt"),
+    ).filter(
+        JiraTicket.org_id == user.org_id,
+        JiraTicket.pod == pod,
+        JiraTicket.is_deleted == False,
+        JiraTicket.fix_version.isnot(None),
+    ).group_by(JiraTicket.fix_version).all()
+    count_map = {row.fix_version: row.cnt for row in count_rows}
+
+    return [
+        {
             "id": r.id,
             "name": r.name,
             "description": r.description,
             "status": r.status,
             "release_date": r.release_date.isoformat() if r.release_date else None,
-            "ticket_count": ticket_count,
+            "ticket_count": count_map.get(r.name, 0),
             "created_at": r.created_at.isoformat() if r.created_at else None,
-        })
-    return result
+        }
+        for r in releases
+    ]
 
 
 @router.post("/{pod}/releases", status_code=201)
@@ -79,6 +86,13 @@ async def create_release(
     user = Depends(get_current_user),
 ):
     from app.models.base import gen_uuid
+    if db.query(Release).filter(
+        Release.org_id == user.org_id,
+        Release.pod == pod,
+        Release.name == payload.name,
+    ).first():
+        raise HTTPException(409, f"A release named '{payload.name}' already exists in this pod")
+
     r = Release(
         id=gen_uuid(),
         org_id=user.org_id,
@@ -175,6 +189,7 @@ async def delete_release(
         JiraTicket.org_id == user.org_id,
         JiraTicket.pod == pod,
         JiraTicket.fix_version == r.name,
+        JiraTicket.is_deleted == False,
     ).update({"fix_version": None}, synchronize_session=False)
 
     db.delete(r)
@@ -234,6 +249,14 @@ async def set_fix_version(
     ).first()
     if not ticket:
         raise HTTPException(404, "Ticket not found")
+
+    if payload.version_name:
+        release = db.query(Release).filter(
+            Release.name == payload.version_name,
+            Release.org_id == user.org_id,
+        ).first()
+        if release and release.pod != ticket.pod:
+            raise HTTPException(400, "Ticket pod does not match release pod")
 
     ticket.fix_version = payload.version_name
     db.commit()

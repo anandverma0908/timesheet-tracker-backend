@@ -90,7 +90,7 @@ async def semantic_search(
     return [all_results[i] for i in top_indices]
 
 
-async def keyword_search_tickets(query: str, org_id: str, limit: int = 8) -> list[dict]:
+async def keyword_search_tickets(query: str, org_id: str, limit: int = 8, pod: Optional[str] = None) -> list[dict]:
     """Direct SQL keyword search — works immediately even before embeddings are indexed."""
     lower_q = query.lower()
 
@@ -126,6 +126,10 @@ async def keyword_search_tickets(query: str, org_id: str, limit: int = 8) -> lis
     try:
         params: dict = {"org_id": org_id, "limit": limit}
         where_clauses = ["t.org_id = :org_id", "t.is_deleted = false"]
+
+        if pod:
+            where_clauses.append("t.pod = :pod")
+            params["pod"] = pod
 
         # Issue type filter
         if want_bugs and not want_tasks:
@@ -192,12 +196,13 @@ async def keyword_search_tickets(query: str, org_id: str, limit: int = 8) -> lis
         db.close()
 
 
-async def nl_query(query: str, org_id: str, user_context: str = "") -> dict:
-    semantic = await semantic_search(query, org_id, limit=5)
+async def nl_query(query: str, org_id: str, user_context: str = "", pod: Optional[str] = None) -> dict:
+    allowed_pods = {pod} if pod else None
+    semantic = await semantic_search(query, org_id, limit=5, allowed_pods=allowed_pods)
     good_semantic = [r for r in semantic if (r.get("similarity") or 0) >= 0.55]
 
     # Always try keyword search in parallel to supplement or replace semantic results
-    keyword_results = await keyword_search_tickets(query, org_id, limit=8)
+    keyword_results = await keyword_search_tickets(query, org_id, limit=8, pod=pod)
 
     # Merge: prefer good semantic, fill with keyword results not already included
     seen_keys = {r.get("key") for r in good_semantic}

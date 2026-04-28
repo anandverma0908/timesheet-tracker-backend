@@ -221,9 +221,11 @@ async def get_activity(
             UserModel.org_id == current_user.org_id,
             UserModel.name == user,
         ).first()
-        target_id = target_user.id if target_user else current_user.id
+        target_id    = target_user.id    if target_user else current_user.id
+        target_email = target_user.email if target_user else current_user.email
     else:
-        target_id = current_user.id
+        target_id    = current_user.id
+        target_email = current_user.email
 
     items = []
 
@@ -232,9 +234,9 @@ async def get_activity(
         db.query(Worklog, JiraTicket)
         .join(JiraTicket, Worklog.ticket_id == JiraTicket.id)
         .filter(
-            Worklog.user_id   == target_id,
-            Worklog.log_date  >= df,
-            Worklog.log_date  <= dt,
+            Worklog.author_email == target_email,
+            Worklog.log_date     >= df,
+            Worklog.log_date     <= dt,
             JiraTicket.is_deleted == False,
         )
         .all()

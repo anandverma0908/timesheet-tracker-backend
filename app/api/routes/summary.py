@@ -283,6 +283,23 @@ async def engineer_stats(
     me_hours    = sum(float(m.hours or 0) for m in manual_entries)
     active_days = len({w.log_date for w in worklogs} | {m.entry_date for m in manual_entries})
 
+    wl_client_q = (
+        db.query(JiraTicket.client)
+        .join(Worklog, Worklog.ticket_id == JiraTicket.id)
+        .filter(
+            JiraTicket.org_id    == current_user.org_id,
+            JiraTicket.is_deleted == False,
+            Worklog.author       == user,
+        )
+    )
+    if df:          wl_client_q = wl_client_q.filter(Worklog.log_date >= df)
+    if dt:          wl_client_q = wl_client_q.filter(Worklog.log_date <= dt)
+    if pod_list:    wl_client_q = wl_client_q.filter(JiraTicket.pod.in_(pod_list))
+    if client_list: wl_client_q = wl_client_q.filter(JiraTicket.client.in_(client_list))
+    wl_clients   = {row[0] for row in wl_client_q.distinct().all() if row[0]}
+    me_clients   = {m.client for m in manual_entries if m.client}
+    client_count = len(wl_clients | me_clients)
+
     return {
         "user":           user,
         "hours":          round(wl_hours + me_hours, 2),
@@ -290,5 +307,5 @@ async def engineer_stats(
         "tickets":        ticket_count,
         "manual_entries": len(manual_entries),
         "active_days":    active_days,
-        "clients":        1,  # placeholder
+        "clients":        client_count,
     }

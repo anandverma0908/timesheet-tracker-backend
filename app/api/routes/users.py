@@ -7,7 +7,9 @@ from sqlalchemy.orm import Session
 from typing import List
 
 from app.core.database import get_db
-from app.core.dependencies import get_current_user, get_admin
+from app.core.dependencies import get_current_user, get_admin, require_roles
+
+get_admin_or_manager = require_roles("admin", "engineering_manager")
 from app.core.security import hash_password
 from app.models.user import User
 from app.schemas.auth import UserOut
@@ -18,7 +20,7 @@ router = APIRouter(prefix="/api/users", tags=["users"])
 @router.get("", response_model=List[UserOut])
 async def list_users(
     db:   Session = Depends(get_db),
-    user: User    = Depends(get_admin),
+    user: User    = Depends(get_admin_or_manager),
 ):
     users = db.query(User).filter(User.org_id == user.org_id).order_by(User.name).all()
     return [UserOut.model_validate(u) for u in users]

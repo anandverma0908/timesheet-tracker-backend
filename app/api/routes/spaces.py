@@ -22,7 +22,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from sqlalchemy import func
+from sqlalchemy import func, case
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, get_manager_up
@@ -139,55 +139,61 @@ async def list_spaces(
     List all spaces (pods) for the org with summary stats and unified health scores.
     Used by SpacesPage to populate the grid/list/heatmap views.
     """
+    from collections import defaultdict
     from app.models.ticket import JiraTicket, Worklog
     from app.models.sprint import Sprint
     from app.services.health_service import compute_health
 
     org_id = user.org_id
 
-    # All distinct pods from tickets + sprints
-    ticket_pods = db.query(JiraTicket.pod).filter(
+    # Bulk-load all data in 3 queries instead of 3 per pod
+    all_tickets = db.query(JiraTicket).filter(
         JiraTicket.org_id == org_id,
         JiraTicket.is_deleted == False,
         JiraTicket.pod != None,
-    ).distinct().all()
+    ).all()
+
+    all_active_sprints = db.query(Sprint).filter(
+        Sprint.org_id == org_id,
+        Sprint.status == "active",
+        Sprint.pod != None,
+    ).all()
+
+    hours_rows = (
+        db.query(JiraTicket.pod, func.sum(Worklog.hours))
+        .join(Worklog, Worklog.ticket_id == JiraTicket.id)
+        .filter(JiraTicket.org_id == org_id, JiraTicket.is_deleted == False)
+        .group_by(JiraTicket.pod)
+        .all()
+    )
 
     sprint_pods = db.query(Sprint.pod).filter(
         Sprint.org_id == org_id,
         Sprint.pod != None,
     ).distinct().all()
 
-    all_pods = sorted({p for (p,) in ticket_pods + sprint_pods if (p or "").strip()})
+    # Group in Python
+    tickets_by_pod: dict = defaultdict(list)
+    for t in all_tickets:
+        tickets_by_pod[t.pod].append(t)
 
+    sprint_by_pod = {s.pod: s for s in all_active_sprints}
+    hours_by_pod  = {pod: round(float(h or 0), 2) for pod, h in hours_rows}
+
+    all_pods = sorted(
+        {p for p in list(tickets_by_pod.keys()) + [p for (p,) in sprint_pods] if (p or "").strip()}
+    )
+
+    done_keys = {"done", "closed", "resolved"}
     result = []
     for pod in all_pods:
-        tickets = db.query(JiraTicket).filter(
-            JiraTicket.org_id == org_id,
-            JiraTicket.pod == pod,
-            JiraTicket.is_deleted == False,
-        ).all()
+        tickets       = tickets_by_pod[pod]
+        active_sprint = sprint_by_pod.get(pod)
+        health        = compute_health(tickets, active_sprint)
 
-        active_sprint = db.query(Sprint).filter(
-            Sprint.org_id == org_id,
-            Sprint.pod == pod,
-            Sprint.status == "active",
-        ).first()
-
-        health = compute_health(tickets, active_sprint)
-
-        # Ticket counts
-        done_keys     = {"done", "closed", "resolved"}
         n_done        = sum(1 for t in tickets if (t.status or "").lower() in done_keys)
         n_blocked     = sum(1 for t in tickets if (t.status or "").lower() == "blocked")
         n_in_progress = sum(1 for t in tickets if "progress" in (t.status or "").lower())
-
-        total_hours_row = db.query(func.sum(Worklog.hours)).join(
-            JiraTicket, JiraTicket.id == Worklog.ticket_id
-        ).filter(
-            JiraTicket.org_id == org_id,
-            JiraTicket.pod == pod,
-            JiraTicket.is_deleted == False,
-        ).scalar() or 0
 
         result.append({
             "pod":                  pod,
@@ -196,10 +202,11 @@ async def list_spaces(
             "completed_tickets":    n_done,
             "in_progress_tickets":  n_in_progress,
             "blocked_tickets":      n_blocked,
-            "total_hours":          round(float(total_hours_row), 2),
+            "total_hours":          hours_by_pod.get(pod, 0.0),
             "has_active_sprint":    active_sprint is not None,
             "sprint_name":          active_sprint.name if active_sprint else None,
-            **health,  # health_score, radar, delivery_confidence, sprint_prediction, trend, risk_flags
+            "active_sprint_id":     active_sprint.id   if active_sprint else None,
+            **health,
         })
 
     return result
@@ -207,6 +214,7 @@ async def list_spaces(
 
 @router.get("/anomalies")
 async def get_anomalies(
+    pod: Optional[str] = Query(None),
     db: Session = Depends(get_db),
     user = Depends(get_current_user),
 ):
@@ -215,36 +223,44 @@ async def get_anomalies(
     Powers EOSIntelligencePanel → Anomalies tab.
     No LLM needed — deterministic rules over health metrics.
     """
+    from collections import defaultdict
     from app.models.ticket import JiraTicket
     from app.models.sprint import Sprint
     from app.services.health_service import compute_health, detect_anomalies
 
     org_id = user.org_id
 
-    pods = db.query(JiraTicket.pod).filter(
+    # Bulk-load to avoid N+1
+    tix_q = db.query(JiraTicket).filter(
         JiraTicket.org_id == org_id,
         JiraTicket.is_deleted == False,
         JiraTicket.pod != None,
-    ).distinct().all()
+    )
+    if pod:
+        tix_q = tix_q.filter(JiraTicket.pod == pod)
+    all_tickets = tix_q.all()
+
+    sprint_q = db.query(Sprint).filter(
+        Sprint.org_id == org_id,
+        Sprint.status == "active",
+        Sprint.pod != None,
+    )
+    if pod:
+        sprint_q = sprint_q.filter(Sprint.pod == pod)
+    all_active_sprints = sprint_q.all()
+
+    tickets_by_pod: dict = defaultdict(list)
+    for t in all_tickets:
+        tickets_by_pod[t.pod].append(t)
+    sprint_by_pod = {s.pod: s for s in all_active_sprints}
 
     all_anomalies = []
-    for (pod,) in pods:
-        if not (pod or "").strip():
+    for pod_key, tickets in tickets_by_pod.items():
+        if not (pod_key or "").strip():
             continue
-        tickets = db.query(JiraTicket).filter(
-            JiraTicket.org_id == org_id,
-            JiraTicket.pod == pod,
-            JiraTicket.is_deleted == False,
-        ).all()
-        active_sprint = db.query(Sprint).filter(
-            Sprint.org_id == org_id,
-            Sprint.pod == pod,
-            Sprint.status == "active",
-        ).first()
-        health = compute_health(tickets, active_sprint)
-        all_anomalies.extend(detect_anomalies(pod, health))
+        health = compute_health(tickets, sprint_by_pod.get(pod_key))
+        all_anomalies.extend(detect_anomalies(pod_key, health))
 
-    # Sort by severity (high first)
     severity_order = {"high": 0, "medium": 1, "low": 2}
     all_anomalies.sort(key=lambda a: severity_order.get(a["severity"], 9))
     return all_anomalies
@@ -508,19 +524,35 @@ async def get_space_project(
         Epic.pod == pod,
     ).order_by(Epic.created_at.desc()).all()
 
-    project_epics = [
-        {
+    # Compute task_count / completed_count / progress dynamically (avoids stale stored values)
+    _done_statuses = ("Done", "Closed", "Resolved")
+    epic_ids = [e.id for e in epics]
+    _epic_stat_rows = []
+    if epic_ids:
+        _epic_stat_rows = db.query(
+            JiraTicket.epic_id,
+            func.count(JiraTicket.id).label("total"),
+            func.sum(case((JiraTicket.status.in_(_done_statuses), 1), else_=0)).label("done"),
+        ).filter(
+            JiraTicket.epic_id.in_(epic_ids),
+            JiraTicket.is_deleted == False,
+        ).group_by(JiraTicket.epic_id).all()
+    _epic_stats = {row.epic_id: (row.total, int(row.done or 0)) for row in _epic_stat_rows}
+
+    project_epics = []
+    for e in epics:
+        total, done = _epic_stats.get(e.id, (0, 0))
+        progress = round((done / total) * 100) if total else 0
+        project_epics.append({
             "id": e.id,
             "title": e.title,
             "color": e.color or "#4F7EFF",
             "startDate": e.start_date.isoformat() if e.start_date else "",
             "endDate": e.end_date.isoformat() if e.end_date else "",
-            "progress": e.progress or 0,
-            "tasks": e.task_count or 0,
-            "completed": e.completed_count or 0,
-        }
-        for e in epics
-    ]
+            "progress": progress,
+            "tasks": total,
+            "completed": done,
+        })
 
     # ── Weekly activity (tickets created per day of week, last 7 days) ──
     today = date.today()
@@ -595,7 +627,10 @@ async def get_space_project(
         "members": members,
         "sprints": project_sprints,
         "epics": project_epics,
-        "startDate": "2026-01-01",
+        "startDate": min(
+            (sp.start_date for sp in sprints if sp.start_date),
+            default=date.today(),
+        ).isoformat(),
         "progress": progress,
         "totalTickets": total_tickets,
         "completedTickets": completed_tickets,
@@ -651,25 +686,40 @@ async def get_space_epics(
     user = Depends(get_current_user),
 ):
     from app.models.epic import Epic
+    from app.models.ticket import JiraTicket
 
     epics = db.query(Epic).filter(
         Epic.org_id == user.org_id,
         Epic.pod == pod,
     ).order_by(Epic.created_at.desc()).all()
 
-    return [
-        {
+    _done_statuses = ("Done", "Closed", "Resolved")
+    epic_ids = [e.id for e in epics]
+    stat_rows = db.query(
+        JiraTicket.epic_id,
+        func.count(JiraTicket.id).label("total"),
+        func.sum(case((JiraTicket.status.in_(_done_statuses), 1), else_=0)).label("done"),
+    ).filter(
+        JiraTicket.epic_id.in_(epic_ids),
+        JiraTicket.is_deleted == False,
+    ).group_by(JiraTicket.epic_id).all() if epic_ids else []
+    stats = {row.epic_id: (row.total, int(row.done or 0)) for row in stat_rows}
+
+    result = []
+    for e in epics:
+        total, done = stats.get(e.id, (0, 0))
+        progress = round((done / total) * 100) if total else 0
+        result.append({
             "id": e.id,
             "title": e.title,
             "color": e.color or "#4F7EFF",
             "startDate": e.start_date.isoformat() if e.start_date else "",
             "endDate": e.end_date.isoformat() if e.end_date else "",
-            "progress": e.progress or 0,
-            "tasks": e.task_count or 0,
-            "completed": e.completed_count or 0,
-        }
-        for e in epics
-    ]
+            "progress": progress,
+            "tasks": total,
+            "completed": done,
+        })
+    return result
 
 
 @router.post("")
@@ -844,6 +894,12 @@ async def delete_space(
     db.query(Epic).filter(
         Epic.org_id == org_id,
         Epic.pod == pod,
+    ).delete(synchronize_session=False)
+
+    from app.models.space_member import SpaceMember
+    db.query(SpaceMember).filter(
+        SpaceMember.org_id == org_id,
+        SpaceMember.pod == pod,
     ).delete(synchronize_session=False)
 
     db.commit()
@@ -1065,7 +1121,11 @@ async def create_epic(
 ):
     from app.models.epic import Epic
     from app.models.base import gen_uuid
-    from datetime import datetime
+
+    start = date.fromisoformat(payload.start_date) if payload.start_date else None
+    end = date.fromisoformat(payload.end_date) if payload.end_date else None
+    if start and end and end < start:
+        raise HTTPException(400, "end_date must be on or after start_date")
 
     epic = Epic(
         id=gen_uuid(),
@@ -1073,8 +1133,8 @@ async def create_epic(
         pod=pod,
         title=payload.title,
         color=payload.color,
-        start_date=datetime.strptime(payload.start_date, "%Y-%m-%d").date() if payload.start_date else None,
-        end_date=datetime.strptime(payload.end_date, "%Y-%m-%d").date() if payload.end_date else None,
+        start_date=start,
+        end_date=end,
         progress=0,
         task_count=0,
         completed_count=0,
@@ -1113,14 +1173,19 @@ async def update_epic(
     if not epic:
         raise HTTPException(404, "Epic not found")
 
+    new_start = date.fromisoformat(payload.start_date) if payload.start_date else (None if payload.start_date == "" else epic.start_date)
+    new_end = date.fromisoformat(payload.end_date) if payload.end_date else (None if payload.end_date == "" else epic.end_date)
+    if new_start and new_end and new_end < new_start:
+        raise HTTPException(400, "end_date must be on or after start_date")
+
     if payload.title is not None:
         epic.title = payload.title
     if payload.color is not None:
         epic.color = payload.color
     if payload.start_date is not None:
-        epic.start_date = datetime.strptime(payload.start_date, "%Y-%m-%d").date()
+        epic.start_date = date.fromisoformat(payload.start_date) if payload.start_date else None
     if payload.end_date is not None:
-        epic.end_date = datetime.strptime(payload.end_date, "%Y-%m-%d").date()
+        epic.end_date = date.fromisoformat(payload.end_date) if payload.end_date else None
 
     db.commit()
     db.refresh(epic)
@@ -1154,9 +1219,10 @@ async def delete_epic(
     if not epic:
         raise HTTPException(404, "Epic not found")
 
-    # Unlink tickets
+    # Unlink tickets (scoped to org for safety)
     db.query(JiraTicket).filter(
         JiraTicket.epic_id == epic_id,
+        JiraTicket.org_id == user.org_id,
     ).update({"epic_id": None}, synchronize_session=False)
 
     db.delete(epic)
@@ -1187,11 +1253,11 @@ async def get_board_config(
     if not config:
         return {
             "columns": [
-                {"id": "todo", "name": "To Do", "status_mapping": ["To Do"]},
-                {"id": "in_progress", "name": "In Progress", "status_mapping": ["In Progress"]},
-                {"id": "in_review", "name": "In Review", "status_mapping": ["In Review"]},
-                {"id": "blocked", "name": "Blocked", "status_mapping": ["Blocked"]},
-                {"id": "done", "name": "Done", "status_mapping": ["Done"]},
+                {"id": "To Do", "name": "To Do", "status_mapping": ["To Do", "Open", "Reopened"]},
+                {"id": "In Progress", "name": "In Progress", "status_mapping": ["In Progress"]},
+                {"id": "In Review", "name": "In Review", "status_mapping": ["In Review"]},
+                {"id": "Blocked", "name": "Blocked", "status_mapping": ["Blocked"]},
+                {"id": "Done", "name": "Done", "status_mapping": ["Done", "Closed", "Resolved"]},
             ],
             "swimlane_by": "none",
             "wip_limits": {},

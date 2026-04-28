@@ -74,15 +74,18 @@ async def pod_summary(
     user = Depends(get_current_user),
 ):
     """
-    POD-level breakdown: ticket counts by status, total hours, and unified health scores.
-    Health scores come from health_service so they match /spaces/{pod}/health exactly.
+    POD-level breakdown: ticket counts by status, current-month hours, and unified health scores.
+    Single-pass bulk loading eliminates N+1 — 4 queries total regardless of pod count.
     """
     from app.models.ticket import JiraTicket, Worklog
     from app.models.sprint import Sprint
     from app.services.health_service import compute_health
+    from datetime import date
 
     org_id = user.org_id
+    today  = date.today()
 
+    # ── 1. Ticket counts by pod+status (1 query) ───────────────────────────
     pod_tickets = db.query(
         JiraTicket.pod,
         JiraTicket.status,
@@ -92,7 +95,6 @@ async def pod_summary(
         JiraTicket.is_deleted == False,
     ).group_by(JiraTicket.pod, JiraTicket.status).all()
 
-    # Aggregate by pod
     pods: dict = {}
     for row in pod_tickets:
         p = (row.pod or "").strip()
@@ -102,7 +104,7 @@ async def pod_summary(
             pods[p] = {"pod": p, "statuses": {}, "total_hours": 0}
         pods[p]["statuses"][row.status or ""] = row.count
 
-    # Add hours
+    # ── 2. Hours logged this month (1 query, date-scoped) ──────────────────
     pod_hours = db.query(
         JiraTicket.pod,
         func.sum(Worklog.hours).label("total_hours"),
@@ -111,6 +113,8 @@ async def pod_summary(
     ).filter(
         JiraTicket.org_id    == org_id,
         JiraTicket.is_deleted == False,
+        func.extract("month", Worklog.log_date) == today.month,
+        func.extract("year",  Worklog.log_date) == today.year,
     ).group_by(JiraTicket.pod).all()
 
     for row in pod_hours:
@@ -118,33 +122,47 @@ async def pod_summary(
         if p in pods:
             pods[p]["total_hours"] = round(float(row.total_hours), 2)
 
-    # Include sprint-only pods
+    # ── 3. Active/planning sprints only — no ghost pods from old data (1 query) ──
     sprint_pods = db.query(Sprint.pod).filter(
-        Sprint.org_id == org_id,
+        Sprint.org_id  == org_id,
+        Sprint.status.in_(["active", "planning"]),
     ).distinct().all()
     for (spod,) in sprint_pods:
         p = (spod or "").strip()
         if p and p not in pods:
             pods[p] = {"pod": p, "statuses": {}, "total_hours": 0}
 
-    # Attach unified health scores (same algorithm as /spaces/{pod}/health)
+    # ── 4. Bulk-load tickets + active sprints (eliminates N+1 loop) ────────
+    all_tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id    == org_id,
+        JiraTicket.is_deleted == False,
+    ).all()
+
+    tickets_by_pod: dict = {}
+    for t in all_tickets:
+        p = (t.pod or "").strip()
+        if p:
+            tickets_by_pod.setdefault(p, []).append(t)
+
+    active_sprints = db.query(Sprint).filter(
+        Sprint.org_id == org_id,
+        Sprint.status == "active",
+    ).all()
+    sprint_by_pod = {s.pod: s for s in active_sprints}
+
+    # ── 5. Compute health per pod (no per-pod DB queries) ──────────────────
     for p, data in pods.items():
-        tickets = db.query(JiraTicket).filter(
-            JiraTicket.org_id == org_id,
-            JiraTicket.pod == p,
-            JiraTicket.is_deleted == False,
-        ).all()
-        active_sprint = db.query(Sprint).filter(
-            Sprint.org_id == org_id,
-            Sprint.pod == p,
-            Sprint.status == "active",
-        ).first()
-        health = compute_health(tickets, active_sprint)
+        pod_tix   = tickets_by_pod.get(p, [])
+        active_sp = sprint_by_pod.get(p)
+        health    = compute_health(pod_tix, active_sp)
         data["health_score"]        = health["health_score"]
         data["delivery_confidence"] = health["delivery_confidence"]
         data["sprint_prediction"]   = health["sprint_prediction"]
-        data["has_active_sprint"]   = active_sprint is not None
+        data["has_active_sprint"]   = active_sp is not None
+        data["sprint_name"]         = active_sp.name if active_sp else None
+        data["active_sprint_id"]    = active_sp.id   if active_sp else None
         data["risk_flags"]          = health["risk_flags"]
+        data["trend"]               = health.get("trend", [])
 
     return list(pods.values())
 

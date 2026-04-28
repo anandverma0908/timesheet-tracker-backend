@@ -49,16 +49,35 @@ router = APIRouter(prefix="/api/tickets", tags=["tickets"])
 os.makedirs(settings.upload_dir, exist_ok=True)
 
 VALID_STATUSES = ["Backlog", "To Do", "In Progress", "In Review", "Done", "Blocked"]
+VALID_ISSUE_TYPES = {"Story", "Bug", "Task", "Epic", "Subtask", "Improvement"}
+ALLOWED_ATTACHMENT_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp",
+    ".mp4", ".webm", ".mov",
+    ".pdf", ".txt", ".md", ".csv", ".xlsx", ".xls", ".docx", ".doc",
+    ".zip", ".tar", ".gz",
+    ".json", ".xml", ".yaml", ".yml",
+}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _next_jira_key(db: Session, org_id: str) -> str:
+def _next_jira_key(db: Session, org_id: str, pod: Optional[str] = None) -> str:
+    import hashlib
+    sa = __import__("sqlalchemy")
+    prefix = (pod or "TRKLY").strip().upper()
+    # Advisory lock scoped per (org, pod prefix) to prevent concurrent duplicate key generation
+    lock_key = f"{org_id}:{prefix}"
+    lock_id = int(hashlib.md5(lock_key.encode()).hexdigest()[:8], 16) % (2**31)
+    db.execute(sa.text(f"SELECT pg_advisory_xact_lock({lock_id})"))
+    # Include soft-deleted rows so numbers are never reused (avoids unique constraint conflicts)
     result = db.execute(
-        __import__("sqlalchemy").text("SELECT COUNT(*) FROM jira_tickets WHERE org_id = :oid"),
-        {"oid": org_id},
+        sa.text(
+            "SELECT COUNT(*) FROM jira_tickets "
+            "WHERE org_id = :oid AND project_key = :prefix"
+        ),
+        {"oid": org_id, "prefix": prefix},
     ).scalar()
-    return f"TRKLY-{(result or 0) + 1}"
+    return f"{prefix}-{(result or 0) + 1}"
 
 
 def _write_audit(db: Session, entity_id: str, org_id: str, user_id: str, action: str, diff: dict):
@@ -182,8 +201,14 @@ async def nl_create_ticket(
     if "error" in fields:
         fields = {"title": body.text[:100]}
 
+    raw_issue_type = fields.get("issue_type", "Task")
+    raw_priority   = fields.get("priority", "Medium")
+    raw_sp         = fields.get("story_points")
+
     from app.models.base import gen_uuid
-    jira_key = _next_jira_key(db, user.org_id)
+    # pod from the request body takes priority; AI extraction is a fallback
+    pod = body.pod or fields.get("pod")
+    jira_key = _next_jira_key(db, user.org_id, pod)
     ticket = JiraTicket(
         id=gen_uuid(),
         org_id=user.org_id,
@@ -191,14 +216,14 @@ async def nl_create_ticket(
         project_key=jira_key.split("-")[0],
         summary=fields.get("title", body.text[:100]),
         description=fields.get("description"),
-        issue_type=fields.get("issue_type", "Task"),
-        priority=fields.get("priority", "Medium"),
+        issue_type=raw_issue_type if raw_issue_type in VALID_ISSUE_TYPES else "Task",
+        priority=raw_priority if raw_priority in {"Highest", "High", "Medium", "Low", "Lowest"} else "Medium",
         status="To Do",
-        pod=fields.get("pod"),
+        pod=pod,
         client=fields.get("client"),
         assignee=fields.get("assignee"),
         reporter=user.name,
-        story_points=fields.get("story_points"),
+        story_points=int(raw_sp) if isinstance(raw_sp, (int, float)) and int(raw_sp) in {1,2,3,5,8,13,21} else None,
         labels=fields.get("labels") or [],
         is_deleted=False,
     )
@@ -256,7 +281,7 @@ async def create_ticket(
     user: User    = Depends(get_current_user),
 ):
     from app.models.base import gen_uuid
-    jira_key = body.jira_key or _next_jira_key(db, user.org_id)
+    jira_key = body.jira_key or _next_jira_key(db, user.org_id, body.pod)
     # Resolve parent and epic by key
     parent_id = None
     if body.parent_key:
@@ -300,6 +325,8 @@ async def create_ticket(
         fix_version=body.fix_version,
         parent_id=parent_id,
         epic_id=epic_id,
+        original_estimate_hours=body.original_estimate_hours or 0,
+        remaining_estimate_hours=body.remaining_estimate_hours or 0,
         is_deleted=False,
     )
     db.add(ticket)
@@ -478,41 +505,9 @@ async def transition_status(
     })
     db.commit()
     db.refresh(ticket)
-    # Automation hook
     from app.services.automation_engine import run_automations
     await run_automations("status_change", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key, "old_status": old_status, "new_status": body.status}, user.org_id, ticket.pod or "", db)
-    return TicketOut(**_to_out(ticket))
-
-
-@router.post("/{key}/status", response_model=TicketOut)
-async def transition_status_by_key(
-    key: str,
-    body: StatusTransition,
-    db:   Session = Depends(get_db),
-    user: User    = Depends(get_current_user),
-):
-    if body.status not in VALID_STATUSES:
-        raise HTTPException(400, f"Invalid status. Must be one of: {VALID_STATUSES}")
-
-    ticket = db.query(JiraTicket).filter(
-        JiraTicket.jira_key == key,
-        JiraTicket.org_id == user.org_id,
-        JiraTicket.is_deleted == False,
-    ).first()
-    if not ticket:
-        raise HTTPException(404, "Ticket not found")
-
-    old_status    = ticket.status
-    ticket.status = body.status
-    _write_audit(db, ticket.id, user.org_id, user.id, "status_changed", {
-        "old": old_status, "new": body.status
-    })
-    db.commit()
-    db.refresh(ticket)
-    # Automation hook
-    from app.services.automation_engine import run_automations
-    await run_automations("status_change", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key, "old_status": old_status, "new_status": body.status}, user.org_id, ticket.pod or "", db)
-    return TicketOut(**_to_out(ticket))
+    return TicketOut(**_to_out(ticket, db))
 
 
 # ── COMMENTS ─────────────────────────────────────────────────────────────────
@@ -597,7 +592,7 @@ async def edit_comment(
     ).first()
     if not comment:
         raise HTTPException(404, "Comment not found")
-    if comment.author_id != user.id and user.role != "admin":
+    if comment.author_id != user.id and (user.role or "") != "admin":
         raise HTTPException(403, "Not allowed to edit this comment")
     comment.body = body.body
     db.commit()
@@ -629,7 +624,7 @@ async def delete_comment(
     ).first()
     if not comment:
         raise HTTPException(404, "Comment not found")
-    if comment.author_id != user.id and user.role != "admin":
+    if comment.author_id != user.id and (user.role or "") != "admin":
         raise HTTPException(403, "Not allowed to delete this comment")
     comment.is_deleted = True
     _write_audit(db, ticket.id, user.org_id, user.id, "deleted comment", {})
@@ -649,13 +644,23 @@ async def upload_attachment(
     if not ticket:
         raise HTTPException(404, "Ticket not found")
 
-    ext       = os.path.splitext(file.filename or "")[1]
+    ext = os.path.splitext(file.filename or "")[1].lower()
+    if ext not in ALLOWED_ATTACHMENT_EXTENSIONS:
+        raise HTTPException(415, f"File type '{ext}' not allowed")
+
     safe_name = f"{uuid.uuid4().hex}{ext}"
     dest      = os.path.join(settings.upload_dir, safe_name)
-    contents  = await file.read()
 
-    if len(contents) > settings.max_upload_bytes:
-        raise HTTPException(413, "File too large")
+    # Read in chunks with size guard
+    CHUNK = 256 * 1024  # 256 KB
+    contents = bytearray()
+    while True:
+        chunk = await file.read(CHUNK)
+        if not chunk:
+            break
+        contents.extend(chunk)
+        if len(contents) > settings.max_upload_bytes:
+            raise HTTPException(413, "File too large")
 
     with open(dest, "wb") as f:
         f.write(contents)
@@ -746,7 +751,9 @@ async def log_time(
     if not ticket:
         raise HTTPException(404, "Ticket not found")
 
-    hours    = float(body.get("hours", 0))
+    hours    = float(body.get("hours") or 0)
+    if hours <= 0:
+        raise HTTPException(400, "hours must be greater than 0")
     comment  = body.get("comment") or body.get("note") or ""
     log_date_str = body.get("date")
     log_date = None
@@ -902,7 +909,7 @@ async def link_ticket_to_epic(
     _write_audit(db, ticket.id, user.org_id, user.id, "epic_linked", {"epic_id": body.epic_id})
     db.commit()
     db.refresh(ticket)
-    return TicketOut(**_to_out(ticket))
+    return TicketOut(**_to_out(ticket, db))
 
 
 # ── SUB-TASKS ─────────────────────────────────────────────────────────────────

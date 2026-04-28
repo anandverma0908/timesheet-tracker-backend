@@ -13,14 +13,14 @@ Return JSON with these exact fields:
 {{
   "title": "concise ticket title (max 100 chars)",
   "description": "expanded description with more detail",
-  "issue_type": "Bug|Story|Task|Epic",
-  "priority": "Critical|High|Medium|Low",
+  "issue_type": "Bug|Story|Task|Epic|Subtask|Improvement",
+  "priority": "Highest|High|Medium|Low|Lowest",
   "pod": "one of: DPAI, EDM, SNOP, SNOE, PA, IAM, PLAT, SNPRM, TMSNG",
   "client": "client name or null",
   "story_points": 1,
   "labels": ["label1"],
   "assignee": "exact name from the available team members list that best fits this ticket, or null",
-  "confidence": 0.0,
+  "confidence": 0.85,
   "reasoning": "brief explanation"
 }}"""
 
@@ -51,4 +51,5 @@ async def full_analysis(nl_text: str, org_id: str, available_users: list = []) -
         "fields":         fields,
         "duplicates":     dupes,
         "has_duplicates": len(dupes) > 0,
+        "confidence":     fields.get("confidence") if isinstance(fields.get("confidence"), (int, float)) else None,
     }

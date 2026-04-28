@@ -569,25 +569,33 @@ async def nova_query(
         DONE = {"Done","Closed","Resolved","Won't Fix","Duplicate","Cancelled","Rejected"}
         today = date.today()
 
-        all_tix = db.query(JiraTicket).filter(
+        tix_q = db.query(JiraTicket).filter(
             JiraTicket.org_id    == user.org_id,
             JiraTicket.is_deleted == False,
-        ).all()
+        )
+        if body.pod:
+            tix_q = tix_q.filter(JiraTicket.pod == body.pod)
+        all_tix = tix_q.all()
         open_tix    = [t for t in all_tix if (t.status or "") not in DONE]
         my_tix      = [t for t in open_tix if t.assignee == user.name]
         blocked     = [t for t in open_tix if "block" in (t.status or "").lower()]
         overdue     = [t for t in open_tix if t.due_date and t.due_date < today]
 
-        sprint = db.query(SprintModel).filter(
+        sprint_q = db.query(SprintModel).filter(
             SprintModel.org_id == user.org_id,
             SprintModel.status == "active",
-        ).first()
+        )
+        if body.pod:
+            sprint_q = sprint_q.filter(SprintModel.pod == body.pod)
+        sprint = sprint_q.first()
 
         # Compact context string injected into every Nova query
         ctx_lines = [
             f"Engineer asking: {user.name} (role: {user.role or 'engineer'}).",
-            f"Project has {len(open_tix)} open tickets total; {len(my_tix)} assigned to {user.name}.",
         ]
+        if body.pod:
+            ctx_lines.append(f"Query is scoped to pod: {body.pod}.")
+        ctx_lines.append(f"Project has {len(open_tix)} open tickets total; {len(my_tix)} assigned to {user.name}.")
         if blocked:
             ctx_lines.append(f"Currently blocked: {', '.join(t.jira_key + ' (' + (t.summary or '')[:40] + ')' for t in blocked[:4])}.")
         if overdue:
@@ -603,7 +611,7 @@ async def nova_query(
 
         user_context = " ".join(ctx_lines)
 
-        data    = await nl_query(body.query, user.org_id, user_context=user_context)
+        data    = await nl_query(body.query, user.org_id, user_context=user_context, pod=body.pod)
         return NovaQueryOut(answer=data["answer"], sources=data["sources"])
 
     except Exception as e:
@@ -985,9 +993,10 @@ Rules:
 
 @router.post("/spaces-brief/{pod}")
 async def spaces_brief(
-    pod: str,
-    db:   Session = Depends(get_db),
-    user: User    = Depends(get_current_user),
+    pod:   str,
+    force: bool   = Query(False, description="Bypass cache and regenerate"),
+    db:    Session = Depends(get_db),
+    user:  User    = Depends(get_current_user),
 ):
     """
     EOS Project Brief for a pod's SummaryTab.
@@ -1040,7 +1049,10 @@ async def spaces_brief(
     ) or "No tickets."
 
     # ── Cache key: hash of all deterministic inputs ──
+    # Bump _BRIEF_V to invalidate all cached briefs and force regeneration.
+    _BRIEF_V = "v2"
     data_hash = _compute_data_hash(
+        _BRIEF_V,
         pod,
         health["health_score"],
         health["radar"],
@@ -1049,12 +1061,14 @@ async def spaces_brief(
         ticket_sample,
     )
 
+    # Delete all rows for this (org, pod) and start fresh when forced or hash mismatch.
+    # This prevents stale/duplicate cache entries from being returned.
     cached = db.query(SpaceBrief).filter(
         SpaceBrief.org_id == org_id,
-        SpaceBrief.pod == pod,
+        SpaceBrief.pod    == pod,
     ).first()
 
-    if cached and cached.data_hash == data_hash and cached.brief:
+    if not force and cached and cached.data_hash == data_hash and cached.brief:
         return {
             "pod":             pod,
             "health_score":    health["health_score"],
@@ -1065,12 +1079,21 @@ async def spaces_brief(
             "nova_powered":    True,
         }
 
-    prompt = f"""Pod: {pod}
+    # Purge any stale rows for this pod before writing fresh data
+    db.query(SpaceBrief).filter(
+        SpaceBrief.org_id == org_id,
+        SpaceBrief.pod    == pod,
+    ).delete(synchronize_session=False)
+    db.flush()
+
+    prompt = f"""You are EOS, an engineering operations system. Analyse only the {pod} pod data below — do NOT reference or invent ticket keys from other pods.
+
+Pod: {pod}
 Health score: {health['health_score']}/100. Radar: {health['radar']}.
 Tickets: {len(tickets)} total, {done} done, {blocked} blocked, {overdue} overdue.
 {sprint_ctx}
 
-Sample tickets:
+{pod} pod sample tickets (ONLY reference keys from this list):
 {ticket_sample}
 
 Write a concise EOS project brief (2-3 sentences) summarising this pod's status.
@@ -1080,7 +1103,7 @@ Then return exactly 3 insight signals in this JSON format — no prose before or
   "brief": "...",
   "velocity_signal": "one sentence about delivery pace or sprint progress",
   "risk_signal": "one sentence about the main risk (blockers, overdue, tech debt)",
-  "recommendation": "one concrete actionable recommendation for the team lead"
+  "recommendation": "one concrete actionable recommendation for the {pod} team lead"
 }}"""
 
     try:
@@ -1090,23 +1113,21 @@ Then return exactly 3 insight signals in this JSON format — no prose before or
         )
         data = _parse_nova_json(raw)
         if isinstance(data, dict) and "brief" in data:
-            # Upsert cache
-            if not cached:
-                cached = SpaceBrief(org_id=org_id, pod=pod)
-                db.add(cached)
-            cached.data_hash = data_hash
-            cached.brief = data.get("brief", "")
-            cached.velocity_signal = data.get("velocity_signal", "")
-            cached.risk_signal = data.get("risk_signal", "")
-            cached.recommendation = data.get("recommendation", "")
+            new_cached = SpaceBrief(org_id=org_id, pod=pod)
+            new_cached.data_hash        = data_hash
+            new_cached.brief            = data.get("brief", "")
+            new_cached.velocity_signal  = data.get("velocity_signal", "")
+            new_cached.risk_signal      = data.get("risk_signal", "")
+            new_cached.recommendation   = data.get("recommendation", "")
+            db.add(new_cached)
             db.commit()
             return {
                 "pod":              pod,
                 "health_score":     health["health_score"],
-                "brief":            cached.brief,
-                "velocity_signal":  cached.velocity_signal,
-                "risk_signal":      cached.risk_signal,
-                "recommendation":   cached.recommendation,
+                "brief":            new_cached.brief,
+                "velocity_signal":  new_cached.velocity_signal,
+                "risk_signal":      new_cached.risk_signal,
+                "recommendation":   new_cached.recommendation,
                 "nova_powered":     True,
             }
     except Exception:
@@ -1120,25 +1141,114 @@ Then return exactly 3 insight signals in this JSON format — no prose before or
     rc = ("Unblock critical tickets first." if blocked >= 2
           else "Focus on completing in-progress work before pulling new tickets.")
 
-    # Cache fallback too so it doesn't flip-flop between AI and fallback
-    if not cached:
-        cached = SpaceBrief(org_id=org_id, pod=pod)
-        db.add(cached)
-    cached.data_hash = data_hash
-    cached.brief = f"{pod} pod health is {health['health_score']}/100. {done}/{len(tickets)} tickets complete."
-    cached.velocity_signal = vs
-    cached.risk_signal = rs
-    cached.recommendation = rc
+    new_cached = SpaceBrief(org_id=org_id, pod=pod)
+    new_cached.data_hash        = data_hash
+    new_cached.brief            = f"{pod} pod health is {health['health_score']}/100. {done}/{len(tickets)} tickets complete."
+    new_cached.velocity_signal  = vs
+    new_cached.risk_signal      = rs
+    new_cached.recommendation   = rc
+    db.add(new_cached)
     db.commit()
 
     return {
         "pod":             pod,
         "health_score":    health["health_score"],
-        "brief":           cached.brief,
+        "brief":           new_cached.brief,
         "velocity_signal": vs,
         "risk_signal":     rs,
         "recommendation":  rc,
         "nova_powered":    False,
+    }
+
+
+@router.post("/health-forecast/{pod}")
+async def health_forecast(
+    pod: str,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    """
+    EOS health forecast for a pod — AI-generated course-correction options.
+    Returns missed_weeks, summary, and 2-3 specific actionable options.
+    """
+    import asyncio, json
+    from datetime import date
+    from app.ai.nova import chat
+    from app.models.ticket import JiraTicket
+    from app.models.sprint import Sprint
+    from app.services.health_service import compute_health
+
+    org_id = user.org_id
+    today  = date.today()
+
+    tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id == org_id,
+        JiraTicket.pod == pod,
+        JiraTicket.is_deleted == False,
+    ).all()
+
+    active_sprint = db.query(Sprint).filter(
+        Sprint.org_id == org_id,
+        Sprint.pod == pod,
+        Sprint.status == "active",
+    ).first()
+
+    health              = compute_health(tickets, active_sprint)
+    health_score        = health.get("health_score", 0)
+    delivery_confidence = health.get("delivery_confidence", 0)
+    risk_flags          = health.get("risk_flags", {})
+    sprint_prediction   = health.get("sprint_prediction")
+
+    n_blocked = sum(1 for t in tickets if (t.status or "").lower() == "blocked")
+    n_overdue = sum(1 for t in tickets if t.due_date and t.due_date < today)
+    n_wip     = sum(1 for t in tickets if "progress" in (t.status or "").lower())
+    days_left = (
+        max(0, (active_sprint.end_date - today).days)
+        if active_sprint and active_sprint.end_date else 0
+    )
+    sprint_ctx = (
+        f"Sprint '{active_sprint.name}' has {days_left}d left, "
+        f"prediction: {sprint_prediction or 'N/A'}%."
+        if active_sprint else "No active sprint."
+    )
+
+    prompt = f"""You are EOS, an engineering operations system. Analyse this pod's health and generate course-correction options.
+
+Pod: {pod}
+Health score: {health_score}/100
+Delivery confidence: {delivery_confidence}%
+{sprint_ctx}
+Blocked tickets: {n_blocked} | Overdue: {n_overdue} | WIP: {n_wip}
+Risk flags: blocked={risk_flags.get('blocked',0)}, overdue={risk_flags.get('overdue',0)}, stale={risk_flags.get('stale',0)}, bug_rate={risk_flags.get('bug_rate',0)}%
+
+Return ONLY a JSON object — no prose, no markdown fences:
+{{"missed_weeks": <int 0-12>, "summary": "<1 concise sentence about pod trajectory>", "options": [{{"label": "<specific action>", "impact": "<measurable expected outcome>", "risk": "Low|Medium|High"}}]}}
+
+Rules: missed_weeks=0 if on track. Give 0 options if on track, 2-3 if at risk. Be specific — reference actual numbers (blocked count, sprint days, etc)."""
+
+    try:
+        raw  = await asyncio.wait_for(
+            chat(user_message=prompt, temperature=0, max_tokens=400),
+            timeout=12.0,
+        )
+        data = json.loads(raw) if raw else {}
+        if not isinstance(data, dict) or "options" not in data:
+            raise ValueError("bad shape")
+    except Exception:
+        missed = 0 if health_score >= 70 else 1 if health_score >= 55 else 3 if health_score >= 40 else 6
+        data = {
+            "missed_weeks": missed,
+            "summary": f"{pod} is {'on track' if missed == 0 else f'at risk — may miss milestone by {missed} week(s)'}.",
+            "options": [] if missed == 0 else [
+                {"label": f"Resolve {n_blocked} blocked ticket(s) within 48h", "impact": "+15–25% throughput", "risk": "Low"},
+                {"label": "Reduce WIP — complete top 2 tickets before starting new ones", "impact": "Improved focus and delivery speed", "risk": "Low"},
+            ],
+        }
+
+    return {
+        **data,
+        "health_score":        health_score,
+        "delivery_confidence": delivery_confidence,
     }
 
 

@@ -12,7 +12,7 @@ Endpoints:
 """
 
 from datetime import date, timedelta
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -27,11 +27,19 @@ router = APIRouter(prefix="/api/sprints", tags=["sprints"])
 # ── Schemas ────────────────────────────────────────────────────────────────
 
 class SprintCreate(BaseModel):
-    name:       str
+    name:        str
+    goal:        Optional[str]       = None
+    start_date:  Optional[date]      = None
+    end_date:    Optional[date]      = None
+    project_id:  Optional[str]       = None
+    ticket_keys: Optional[List[str]] = None
+
+
+class SprintStartBody(BaseModel):
+    name:       Optional[str]  = None
     goal:       Optional[str]  = None
     start_date: Optional[date] = None
     end_date:   Optional[date] = None
-    project_id: Optional[str]  = None
 
 
 class SprintOut(BaseModel):
@@ -78,12 +86,21 @@ async def list_sprints(
         q = q.filter(Sprint.pod == project_id)
     sprints = q.order_by(Sprint.created_at.desc()).all()
 
+    # Bulk-load all tickets for these sprints — avoids N+1 (BUG-09)
+    from collections import defaultdict
+    sprint_ids = [sp.id for sp in sprints]
+    all_tickets = db.query(JiraTicket).filter(
+        JiraTicket.sprint_id.in_(sprint_ids),
+        JiraTicket.is_deleted == False,
+    ).all() if sprint_ids else []
+
+    tickets_by_sprint: dict = defaultdict(list)
+    for t in all_tickets:
+        tickets_by_sprint[t.sprint_id].append(t)
+
     result = []
     for sp in sprints:
-        tickets = db.query(JiraTicket).filter(
-            JiraTicket.sprint_id == sp.id,
-            JiraTicket.is_deleted == False,
-        ).all()
+        tickets   = tickets_by_sprint[sp.id]
         done_pts  = sum(t.story_points or 0 for t in tickets if t.status == "Done")
         total_pts = sum(t.story_points or 0 for t in tickets)
         result.append({
@@ -111,6 +128,10 @@ async def create_sprint(
     from app.models.sprint import Sprint
     from app.models.base import gen_uuid
 
+    # Validate dates before creating (BUG-18)
+    if body.start_date and body.end_date and body.end_date < body.start_date:
+        raise HTTPException(400, "end_date must be on or after start_date")
+
     sprint = Sprint(
         id=gen_uuid(),
         org_id=user.org_id,
@@ -124,6 +145,17 @@ async def create_sprint(
     db.add(sprint)
     db.commit()
     db.refresh(sprint)
+
+    # Assign drafted tickets to the new sprint if provided
+    if body.ticket_keys:
+        from app.models.ticket import JiraTicket
+        db.query(JiraTicket).filter(
+            JiraTicket.org_id    == user.org_id,
+            JiraTicket.jira_key.in_(body.ticket_keys),
+            JiraTicket.is_deleted == False,
+        ).update({"sprint_id": sprint.id}, synchronize_session=False)
+        db.commit()
+
     return sprint
 
 
@@ -174,6 +206,7 @@ async def get_sprint(
 @router.post("/{sprint_id}/start")
 async def start_sprint(
     sprint_id: str,
+    body: SprintStartBody = SprintStartBody(),
     db:   Session = Depends(get_db),
     user = Depends(get_tech_lead_up),
 ):
@@ -189,9 +222,16 @@ async def start_sprint(
     if sprint.status != "planning":
         raise HTTPException(400, f"Sprint is already {sprint.status}")
 
+    # Apply editable fields from the Start Sprint modal (BUG-08)
+    if body.name and body.name.strip():
+        sprint.name = body.name.strip()
+    if body.goal is not None:
+        sprint.goal = body.goal
+    if body.end_date:
+        sprint.end_date = body.end_date
+
     sprint.status = "active"
-    if not sprint.start_date:
-        sprint.start_date = date.today()
+    sprint.start_date = body.start_date or sprint.start_date or date.today()
 
     # Notify all members assigned tickets in this sprint
     assignees = db.query(JiraTicket.assignee_email).filter(
@@ -270,6 +310,35 @@ async def complete_sprint(
     }
 
 
+@router.delete("/{sprint_id}", status_code=200)
+async def delete_sprint(
+    sprint_id: str,
+    db:   Session = Depends(get_db),
+    user = Depends(get_tech_lead_up),
+):
+    """Delete a sprint that is still in planning status. Tickets are moved back to backlog."""
+    from app.models.sprint import Sprint
+    from app.models.ticket import JiraTicket
+
+    sprint = db.query(Sprint).filter(
+        Sprint.id == sprint_id, Sprint.org_id == user.org_id
+    ).first()
+    if not sprint:
+        raise HTTPException(404, "Sprint not found")
+    if sprint.status != "planning":
+        raise HTTPException(400, "Only planning sprints can be deleted")
+
+    # Unassign all tickets — move them back to backlog
+    db.query(JiraTicket).filter(
+        JiraTicket.sprint_id  == sprint_id,
+        JiraTicket.is_deleted == False,
+    ).update({"sprint_id": None}, synchronize_session=False)
+
+    db.delete(sprint)
+    db.commit()
+    return {"message": f"Sprint '{sprint.name}' deleted", "sprint_id": sprint_id}
+
+
 @router.post("/{sprint_id}/tickets", status_code=200)
 async def add_ticket_to_sprint(
     sprint_id: str,
@@ -298,6 +367,10 @@ async def add_ticket_to_sprint(
     ).first()
     if not ticket:
         raise HTTPException(404, f"Ticket '{ticket_key}' not found")
+
+    # Prevent cross-pod assignment (BUG-19)
+    if sprint.pod and ticket.pod and sprint.pod != ticket.pod:
+        raise HTTPException(400, f"Ticket '{ticket_key}' belongs to pod '{ticket.pod}', not '{sprint.pod}'")
 
     ticket.sprint_id = sprint_id
     db.commit()

@@ -90,6 +90,10 @@ async def lifespan(app: FastAPI):
             _conn.execute(text(
                 "ALTER TABLE wiki_embeddings ADD COLUMN IF NOT EXISTS embedding vector(384)"
             ))
+            # Add label column to code_review_snapshots if it was created before this migration
+            _conn.execute(text(
+                "ALTER TABLE code_review_snapshots ADD COLUMN IF NOT EXISTS label VARCHAR(500)"
+            ))
             _conn.commit()
             logger.info("pgvector extension and embedding columns verified")
         except Exception as _e:

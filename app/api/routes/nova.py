@@ -703,6 +703,39 @@ async def get_my_standup(
     }
 
 
+@router.get("/standup/my")
+async def get_my_standup_by_date(
+    standup_date: Optional[str] = Query(None, description="ISO date, defaults to today"),
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    """Return the current user's own standup for any given date."""
+    from app.models.sprint import Standup
+
+    target_date = date.fromisoformat(standup_date) if standup_date else date.today()
+    standup = db.query(Standup).filter(
+        Standup.user_id == user.id,
+        Standup.date    == target_date,
+    ).first()
+
+    if not standup:
+        return {"message": "No standup found for this date."}
+
+    return {
+        "id":             standup.id,
+        "user_id":        standup.user_id,
+        "engineer":       user.name,
+        "engineer_email": user.email,
+        "pod":            user.pod or "",
+        "date":           standup.date.isoformat(),
+        "yesterday":      standup.yesterday or "",
+        "today":          standup.today or "",
+        "blockers":       standup.blockers or "",
+        "shared":         standup.is_shared,
+        "created_at":     standup.date.isoformat(),
+    }
+
+
 @router.get("/standup/team")
 async def get_team_standups(
     standup_date: Optional[str] = Query(None, description="ISO date, defaults to today"),

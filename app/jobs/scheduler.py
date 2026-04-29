@@ -212,6 +212,52 @@ async def _burnrate_job():
         logger.error(f"Burn rate job error: {e}")
 
 
+async def _sprint_ending_job():
+    """Daily 8AM: notify org members of sprints ending in 2 days."""
+    try:
+        from app.core.database import SessionLocal
+        from app.models.sprint import Sprint
+        from app.models.user import User
+        from app.models.notification import Notification
+        from app.models.base import gen_uuid
+        import datetime
+
+        db = SessionLocal()
+        today = date.today()
+        target_date = today + datetime.timedelta(days=2)
+
+        sprints = db.query(Sprint).filter(
+            Sprint.status == "active",
+            Sprint.end_date == target_date,
+        ).all()
+
+        for sprint in sprints:
+            users = db.query(User).filter(
+                User.org_id == sprint.org_id,
+                User.status == "active",
+            ).all()
+            for u in users:
+                existing = db.query(Notification).filter(
+                    Notification.user_id == u.id,
+                    Notification.type == "sprint_ending_soon",
+                    Notification.created_at >= datetime.datetime.combine(today, datetime.time.min),
+                ).first()
+                if not existing:
+                    db.add(Notification(
+                        id=gen_uuid(),
+                        org_id=sprint.org_id,
+                        user_id=u.id,
+                        type="sprint_ending_soon",
+                        title=f"Sprint ending in 2 days",
+                        body=f'"{sprint.name}" ends on {target_date.isoformat()}. Make sure tickets are wrapped up.',
+                        link="/sprints",
+                    ))
+        db.commit()
+        db.close()
+    except Exception as e:
+        logger.error(f"Sprint ending job error: {e}")
+
+
 async def _gaps_job():
     """Weekly Monday 8AM: detect knowledge gaps for all orgs."""
     try:
@@ -268,10 +314,17 @@ def start_scheduler() -> None:
         id="gaps_weekly",
         replace_existing=True,
     )
+    scheduler.add_job(
+        _sprint_ending_job,
+        "cron",
+        hour=8, minute=0,
+        id="sprint_ending_daily",
+        replace_existing=True,
+    )
     scheduler.start()
     logger.info(
         f"Scheduler started — sync every {settings.sync_interval_minutes}m, "
-        "standup 9AM daily, burnrate hourly, gaps weekly"
+        "standup 9AM daily, burnrate hourly, gaps weekly, sprint-ending daily"
     )
 
 

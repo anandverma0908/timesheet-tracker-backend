@@ -464,6 +464,23 @@ async def update_ticket(
 
     if diff:
         _write_audit(db, ticket.id, user.org_id, user.id, "updated", diff)
+
+        if "assignee" in diff and diff["assignee"]["new"]:
+            from app.models.notification import Notification as Notif
+            from app.models.base import gen_uuid as _gen
+            assigned_user = db.query(User).filter(
+                User.org_id == user.org_id,
+                User.name == diff["assignee"]["new"],
+            ).first()
+            if assigned_user and assigned_user.id != user.id:
+                db.add(Notif(
+                    id=_gen(), org_id=user.org_id, user_id=assigned_user.id,
+                    type="ticket_assigned",
+                    title=f"Assigned to you: {ticket.jira_key}",
+                    body=ticket.summary[:200],
+                    link=f"/tickets?key={ticket.jira_key}",
+                ))
+
         db.commit()
         db.refresh(ticket)
         background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "")
@@ -503,6 +520,23 @@ async def transition_status(
     _write_audit(db, ticket.id, user.org_id, user.id, "status_changed", {
         "old": old_status, "new": body.status
     })
+
+    if body.status == "Blocked" and ticket.assignee:
+        from app.models.notification import Notification as Notif
+        from app.models.base import gen_uuid as _gen
+        assignee_user = db.query(User).filter(
+            User.org_id == user.org_id,
+            User.name == ticket.assignee,
+        ).first()
+        if assignee_user:
+            db.add(Notif(
+                id=_gen(), org_id=user.org_id, user_id=assignee_user.id,
+                type="blocked_ticket",
+                title=f"{ticket.jira_key} has been blocked",
+                body=ticket.summary[:200],
+                link=f"/tickets?key={ticket.jira_key}",
+            ))
+
     db.commit()
     db.refresh(ticket)
     from app.services.automation_engine import run_automations
@@ -563,6 +597,23 @@ async def add_comment(
     )
     db.add(comment)
     _write_audit(db, ticket.id, user.org_id, user.id, "commented", {"body": body.body[:100]})
+
+    if ticket.assignee:
+        from app.models.notification import Notification as Notif
+        from app.models.base import gen_uuid as _gen
+        assignee_user = db.query(User).filter(
+            User.org_id == user.org_id,
+            User.name == ticket.assignee,
+        ).first()
+        if assignee_user and assignee_user.id != user.id:
+            db.add(Notif(
+                id=_gen(), org_id=user.org_id, user_id=assignee_user.id,
+                type="ticket_commented",
+                title=f"{user.name} commented on {ticket.jira_key}",
+                body=body.body[:200],
+                link=f"/tickets?key={ticket.jira_key}",
+            ))
+
     db.commit()
     db.refresh(comment)
     return CommentOut(
@@ -779,6 +830,16 @@ async def log_time(
     _write_audit(db, ticket.id, user.org_id, user.id, "logged time", {
         "hours": hours, "date": log_date_str, "comment": comment
     })
+
+    from app.models.notification import Notification as Notif
+    db.add(Notif(
+        id=gen_uuid(), org_id=user.org_id, user_id=user.id,
+        type="time_logged",
+        title=f"{hours}h logged on {ticket.jira_key}",
+        body=comment or ticket.summary[:200],
+        link=f"/tickets?key={ticket.jira_key}",
+    ))
+
     db.commit()
     db.refresh(worklog)
 

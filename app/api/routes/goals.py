@@ -181,6 +181,8 @@ async def update_goal(
     if not goal:
         raise HTTPException(404, "Goal not found")
 
+    old_status = goal.status
+
     if body.quarter is not None:
         goal.quarter = body.quarter
     if body.title is not None:
@@ -197,6 +199,24 @@ async def update_goal(
         goal.key_results = [kr.model_dump() for kr in body.key_results]
     if body.linked_sprints is not None:
         goal.linked_sprints = body.linked_sprints
+
+    if body.status and body.status != old_status and body.status in ("at_risk", "behind"):
+        from app.models.notification import Notification as Notif
+        from app.models.base import gen_uuid
+        from app.models.user import User
+        label = "at risk" if body.status == "at_risk" else "behind schedule"
+        owner_user = db.query(User).filter(
+            User.org_id == user.org_id,
+            User.name == goal.owner,
+        ).first() if goal.owner else None
+        if owner_user:
+            db.add(Notif(
+                id=gen_uuid(), org_id=user.org_id, user_id=owner_user.id,
+                type="goal_status_changed",
+                title=f"Goal is {label}: {goal.title[:60]}",
+                body=f"Status changed from {old_status.replace('_', ' ')} to {label}.",
+                link="/goals",
+            ))
 
     db.commit()
     db.refresh(goal)

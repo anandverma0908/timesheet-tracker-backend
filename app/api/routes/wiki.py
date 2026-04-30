@@ -691,3 +691,79 @@ Return JSON with this exact shape:
         return MeetingNotesOut(action_items=actions, structured_md=structured_md)
     except Exception as e:
         raise HTTPException(422, f"NOVA could not parse meeting notes: {e}")
+
+
+# ── Generative template ────────────────────────────────────────────────────────
+
+TEMPLATE_PROMPTS = {
+    "prd": (
+        "Generate a comprehensive Product Requirements Document in Markdown for an engineering team. "
+        "Include sections: Overview, Goals, Non-Goals, User Stories, Functional Requirements, "
+        "Non-Functional Requirements, Success Metrics, and Open Questions. "
+        "Use realistic placeholder content that shows the structure clearly. "
+        "Context hint: {context}"
+    ),
+    "runbook": (
+        "Generate a detailed operations Runbook in Markdown. "
+        "Include sections: Purpose, Prerequisites, Scope, Step-by-Step Procedure (numbered), "
+        "Expected Outputs, Rollback Steps, and Troubleshooting. "
+        "Use realistic placeholder content. Context hint: {context}"
+    ),
+    "sprint_retro": (
+        "Generate a Sprint Retrospective document in Markdown. "
+        "Include sections: Sprint Summary, What Went Well, What to Improve, Root Cause Analysis, "
+        "Action Items table (Action | Owner | Due | Status), and Team Health Check. "
+        "Context hint: {context}"
+    ),
+    "meeting_notes": (
+        "Generate a Meeting Notes template in Markdown with pre-filled structure. "
+        "Include: Date/Time/Attendees header, Agenda, Discussion Points with sub-bullets, "
+        "Decisions Made, Action Items table (Action | Owner | Due), and Next Steps. "
+        "Context hint: {context}"
+    ),
+    "adr": (
+        "Generate an Architecture Decision Record (ADR) in Markdown. "
+        "Include sections: Title, Status, Date, Context and Problem Statement, "
+        "Decision Drivers, Considered Options (with pros/cons table), Decision Outcome, "
+        "Consequences (positive and negative), and Links. "
+        "Context hint: {context}"
+    ),
+    "onboarding": (
+        "Generate an Engineer Onboarding Guide in Markdown. "
+        "Include sections: Welcome, Team Overview, Development Environment Setup (with code blocks), "
+        "Key Systems & Tools, First Week Checklist, Coding Standards, Deployment Process, "
+        "Who to Ask, and Resources. Context hint: {context}"
+    ),
+}
+
+
+@router.post("/ai/generate-template")
+async def generate_template(
+    body: dict,
+    editor: User = Depends(get_editor),
+):
+    """Use EOS to generate rich wiki page content for a given template type."""
+    from app.ai.nova import chat
+
+    template_type = (body.get("template_type") or "").lower().replace(" ", "_").replace("-", "_")
+    context       = (body.get("context") or "").strip()[:500]
+
+    prompt_template = TEMPLATE_PROMPTS.get(template_type)
+    if not prompt_template:
+        raise HTTPException(400, f"Unknown template type '{template_type}'. Valid: {list(TEMPLATE_PROMPTS)}")
+
+    prompt = prompt_template.format(context=context or "general engineering team")
+
+    try:
+        content = await chat(
+            prompt,
+            system_prompt=(
+                "You are EOS, an expert technical writer embedded in Trackly. "
+                "Output clean, well-structured Markdown only — no preamble, no code fences around the whole document."
+            ),
+            temperature=0.4,
+            max_tokens=1200,
+        )
+        return {"content": content.strip()}
+    except Exception as e:
+        raise HTTPException(503, f"EOS template generation failed: {e}")

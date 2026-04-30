@@ -466,6 +466,57 @@ async def sprint_burndown(
     }
 
 
+@router.get("/{sprint_id}/burnup")
+async def sprint_burnup(
+    sprint_id: str,
+    db:   Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    from app.models.sprint import Sprint
+    from app.models.ticket import JiraTicket
+
+    sprint = db.query(Sprint).filter(
+        Sprint.id == sprint_id, Sprint.org_id == user.org_id
+    ).first()
+    if not sprint:
+        raise HTTPException(404, "Sprint not found")
+    if not sprint.start_date or not sprint.end_date:
+        raise HTTPException(400, "Sprint dates not set")
+
+    tickets   = db.query(JiraTicket).filter(
+        JiraTicket.sprint_id  == sprint_id,
+        JiraTicket.is_deleted == False,
+    ).all()
+
+    total_pts = sum(t.story_points or 0 for t in tickets)
+    start     = sprint.start_date
+    end       = sprint.end_date
+    days      = (end - start).days + 1
+    if days < 1:
+        days = 1
+
+    burnup = []
+    for i in range(days):
+        day      = start + timedelta(days=i)
+        completed = sum(
+            t.story_points or 0
+            for t in tickets
+            if t.status == "Done" and t.synced_at and t.synced_at.date() <= day
+        )
+        burnup.append({
+            "date":      day.isoformat(),
+            "completed": completed,
+            "total":     total_pts,
+        })
+
+    return {
+        "sprint_id":    sprint_id,
+        "sprint_name":  sprint.name,
+        "total_points": total_pts,
+        "data":         burnup,
+    }
+
+
 @router.get("/{sprint_id}/velocity")
 async def sprint_velocity(
     sprint_id: str,

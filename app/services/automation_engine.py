@@ -31,6 +31,7 @@ ACTION_TYPES = [
     "add_label",
     "post_comment",
     "create_subtask",
+    "notify_slack",
 ]
 
 
@@ -169,6 +170,25 @@ def _log_audit(db: Session, entity_id: str, org_id: str, user_id: Optional[str],
         action=action,
         diff_json=diff,
     ))
+
+
+    elif rule.action_type == "notify_slack":
+        webhook_url = action.get("webhook_url")
+        if webhook_url:
+            from app.services.webhook_service import _slack_payload
+            import httpx
+            payload_data = {
+                "ticket_key": trigger_data.get("ticket_key", ""),
+                "summary": ticket.summary if ticket else "",
+                "message": action.get("message", f"Automation triggered: {rule.name}"),
+                "old_status": trigger_data.get("old_status"),
+                "new_status": trigger_data.get("new_status"),
+            }
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    await client.post(webhook_url, json=_slack_payload("automation", payload_data))
+            except Exception as e:
+                logger.warning(f"notify_slack action failed: {e}")
 
 
 def _next_key(db: Session, org_id: str) -> str:

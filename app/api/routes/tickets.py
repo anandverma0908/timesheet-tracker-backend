@@ -25,7 +25,7 @@ Endpoints:
 
 import os
 import uuid
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query
 from pydantic import BaseModel
@@ -49,6 +49,17 @@ router = APIRouter(prefix="/api/tickets", tags=["tickets"])
 os.makedirs(settings.upload_dir, exist_ok=True)
 
 VALID_STATUSES = ["Backlog", "To Do", "In Progress", "In Review", "Done", "Blocked"]
+
+# Allowed forward/back transitions per status.
+# None means any transition is allowed from that status.
+ALLOWED_TRANSITIONS: Dict[str, Optional[List[str]]] = {
+    "Backlog":     ["To Do", "In Progress"],
+    "To Do":       ["In Progress", "Backlog"],
+    "In Progress": ["In Review", "To Do", "Blocked", "Done"],
+    "In Review":   ["In Progress", "Done", "Blocked"],
+    "Blocked":     ["In Progress", "To Do"],
+    "Done":        ["In Progress", "To Do"],  # allow re-open
+}
 VALID_ISSUE_TYPES = {"Story", "Bug", "Task", "Epic", "Subtask", "Improvement"}
 ALLOWED_ATTACHMENT_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp",
@@ -334,9 +345,17 @@ async def create_ticket(
     db.commit()
     db.refresh(ticket)
 
-    # Automation hook
+    # Automation + webhook hooks
     from app.services.automation_engine import run_automations
+    from app.services.webhook_service import dispatch_event
     await run_automations("ticket_created", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key}, user.org_id, ticket.pod or "", db)
+    await dispatch_event(user.org_id, "ticket_created", {
+        "ticket_key": ticket.jira_key,
+        "summary": ticket.summary,
+        "assignee": ticket.assignee,
+        "user": user.name,
+        "link": f"/tickets?key={ticket.jira_key}",
+    }, db)
 
     background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "")
     return TicketOut(**_to_out(ticket, db))
@@ -515,7 +534,15 @@ async def transition_status(
     if not ticket:
         raise HTTPException(404, "Ticket not found")
 
-    old_status    = ticket.status
+    old_status = ticket.status
+    allowed = ALLOWED_TRANSITIONS.get(old_status)
+    if allowed is not None and body.status not in allowed:
+        raise HTTPException(
+            422,
+            f"Transition from '{old_status}' to '{body.status}' is not allowed. "
+            f"Allowed: {allowed}",
+        )
+
     ticket.status = body.status
     _write_audit(db, ticket.id, user.org_id, user.id, "status_changed", {
         "old": old_status, "new": body.status
@@ -540,7 +567,22 @@ async def transition_status(
     db.commit()
     db.refresh(ticket)
     from app.services.automation_engine import run_automations
+    from app.services.webhook_service import dispatch_event
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
     await run_automations("status_change", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key, "old_status": old_status, "new_status": body.status}, user.org_id, ticket.pod or "", db)
+    try:
+        sent = await dispatch_event(user.org_id, "status_changed", {
+            "ticket_key": ticket.jira_key,
+            "summary": ticket.summary,
+            "old_status": old_status,
+            "new_status": body.status,
+            "user": user.name,
+            "link": f"/tickets?key={ticket.jira_key}",
+        }, db)
+        _log.info(f"[webhook] status_changed dispatched to {sent} integration(s) for {ticket.jira_key}")
+    except Exception as _e:
+        _log.error(f"[webhook] dispatch_event failed for status_changed: {_e}")
     return TicketOut(**_to_out(ticket, db))
 
 
@@ -598,9 +640,14 @@ async def add_comment(
     db.add(comment)
     _write_audit(db, ticket.id, user.org_id, user.id, "commented", {"body": body.body[:100]})
 
+    from app.models.notification import Notification as Notif
+    from app.models.base import gen_uuid as _gen
+    import re as _re
+
+    notified_ids: set = set()
+
+    # Notify ticket assignee on new comment (skip if commenter is the assignee)
     if ticket.assignee:
-        from app.models.notification import Notification as Notif
-        from app.models.base import gen_uuid as _gen
         assignee_user = db.query(User).filter(
             User.org_id == user.org_id,
             User.name == ticket.assignee,
@@ -613,6 +660,31 @@ async def add_comment(
                 body=body.body[:200],
                 link=f"/tickets?key={ticket.jira_key}",
             ))
+            notified_ids.add(assignee_user.id)
+
+    # Parse @mentions and notify each mentioned user
+    mentioned_names = _re.findall(r"@([\w.]+(?:\s[\w.]+)?)", body.body)
+    for raw_name in mentioned_names:
+        # Match by name (case-insensitive, spaces or dots as separator)
+        name_normalized = raw_name.replace(".", " ").strip()
+        mentioned_user = db.query(User).filter(
+            User.org_id == user.org_id,
+        ).all()
+        matched = next(
+            (u for u in mentioned_user
+             if u.name.lower() == name_normalized.lower()
+             or u.name.lower().replace(" ", ".") == raw_name.lower()),
+            None,
+        )
+        if matched and matched.id != user.id and matched.id not in notified_ids:
+            db.add(Notif(
+                id=_gen(), org_id=user.org_id, user_id=matched.id,
+                type="mentioned",
+                title=f"{user.name} mentioned you in {ticket.jira_key}",
+                body=body.body[:200],
+                link=f"/tickets?key={ticket.jira_key}",
+            ))
+            notified_ids.add(matched.id)
 
     db.commit()
     db.refresh(comment)

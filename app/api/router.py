@@ -26,6 +26,9 @@ from app.api.routes.custom_fields import router as custom_fields_router
 from app.api.routes.tests         import router as tests_router
 from app.api.routes.code_review    import router as code_review_router
 from app.api.routes.manual_entries import router as manual_entries_router
+from app.api.routes.decisions      import router as decisions_router
+from app.api.routes.processes      import router as processes_router
+from app.api.routes.integrations   import router as integrations_router
 
 api_router = APIRouter()
 
@@ -49,3 +52,6 @@ api_router.include_router(custom_fields_router)
 api_router.include_router(tests_router)
 api_router.include_router(code_review_router)
 api_router.include_router(manual_entries_router)
+api_router.include_router(decisions_router)
+api_router.include_router(processes_router)
+api_router.include_router(integrations_router)

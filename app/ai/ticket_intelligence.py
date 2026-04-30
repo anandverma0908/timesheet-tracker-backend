@@ -41,11 +41,22 @@ async def analyse_ticket(text: str, available_users: list = []) -> dict:
         return {"error": str(e), "title": text[:100]}
 
 
+async def _empty_dupes() -> list:
+    return []
+
+
 async def full_analysis(nl_text: str, org_id: str, available_users: list = []) -> dict:
     """Full agentic pipeline: classify + duplicate check in parallel."""
-    init_embed  = embed(nl_text)
     fields_task = analyse_ticket(nl_text, available_users)
-    dupes_task  = find_similar_tickets(init_embed, org_id, threshold=0.72, limit=3, query_text=nl_text)
+
+    # Embedding may fail if sentence_transformers is unavailable or not yet indexed —
+    # degrade gracefully so field analysis still works.
+    try:
+        init_embed = embed(nl_text)
+        dupes_task = find_similar_tickets(init_embed, org_id, threshold=0.55, limit=3, query_text=nl_text)
+    except Exception:
+        dupes_task = _empty_dupes()
+
     fields, dupes = await asyncio.gather(fields_task, dupes_task)
     return {
         "fields":         fields,

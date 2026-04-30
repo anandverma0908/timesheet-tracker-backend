@@ -111,9 +111,11 @@ async def search(
     user:  User            = Depends(get_current_user),
     scope: VisibilityScope = Depends(get_visibility_scope),
 ):
-    """Semantic search over tickets + wiki using pgvector cosine similarity + reranking."""
-    from app.ai.search import semantic_search
+    """Semantic search over tickets + wiki using pgvector cosine similarity + reranking.
+    Falls back to keyword search when embeddings are unavailable or return no results."""
+    from app.ai.search import semantic_search, keyword_search_tickets
 
+    results = []
     try:
         results = await semantic_search(
             query=body.query,
@@ -122,12 +124,21 @@ async def search(
             allowed_emails=scope.allowed_emails if not scope.unrestricted else None,
             allowed_pods=scope.allowed_pods if not scope.unrestricted else None,
         )
+    except Exception:
+        # Semantic search unavailable (e.g. embeddings not indexed, pgvector issue) —
+        # fall through to keyword fallback below.
+        pass
 
-        if body.scope == "tickets":
-            results = [r for r in results if r.get("source_type") == "ticket"]
-        elif body.scope == "wiki":
-            results = [r for r in results if r.get("source_type") == "wiki"]
+    # Fall back to keyword search if semantic returned nothing
+    if not results and body.scope != "wiki":
+        try:
+            results = await keyword_search_tickets(body.query, user.org_id, limit=body.limit or 10)
+        except Exception:
+            pass
 
-        return SearchOut(results=results, query=body.query, scope=body.scope or "all")
-    except Exception as e:
-        raise HTTPException(503, f"Search unavailable: {e}")
+    if body.scope == "tickets":
+        results = [r for r in results if r.get("source_type") == "ticket"]
+    elif body.scope == "wiki":
+        results = [r for r in results if r.get("source_type") == "wiki"]
+
+    return SearchOut(results=results, query=body.query, scope=body.scope or "all")

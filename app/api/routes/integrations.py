@@ -11,7 +11,7 @@ Endpoints:
 
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -175,3 +175,40 @@ async def test_integration(
     if not success:
         raise HTTPException(502, "Test webhook failed — check the URL and try again")
     return {"ok": True, "message": "Test message sent successfully"}
+
+
+class DispatchPayload(BaseModel):
+    event_type: str
+    ticket_key: Optional[str] = None
+    new_status: Optional[str] = None
+    old_status: Optional[str] = None
+    summary: Optional[str] = None
+    assignee: Optional[str] = None
+    message: Optional[str] = None
+
+
+@router.post("/dispatch")
+async def dispatch_integration_event(
+    payload: DispatchPayload,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    """
+    Fire webhooks for a given event from the frontend (used when mock data is active
+    and the real ticket endpoint is not invoked).
+    """
+    from app.services.webhook_service import dispatch_event
+
+    data = {
+        "ticket_key":  payload.ticket_key or "",
+        "summary":     payload.summary or "",
+        "old_status":  payload.old_status or "",
+        "new_status":  payload.new_status or "",
+        "assignee":    payload.assignee or "",
+        "user":        user.name,
+        "message":     payload.message or "",
+        "link":        f"/tickets?key={payload.ticket_key}" if payload.ticket_key else "",
+    }
+
+    sent = await dispatch_event(user.org_id, payload.event_type, data, db)
+    return {"ok": True, "dispatched": sent}

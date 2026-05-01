@@ -50,12 +50,20 @@ async def full_analysis(nl_text: str, org_id: str, available_users: list = []) -
     fields_task = analyse_ticket(nl_text, available_users)
 
     # Embedding may fail if sentence_transformers is unavailable or not yet indexed —
-    # degrade gracefully so field analysis still works.
+    # degrade gracefully: try vector search first, fall back to keyword search.
     try:
         init_embed = embed(nl_text)
         dupes_task = find_similar_tickets(init_embed, org_id, threshold=0.55, limit=3, query_text=nl_text)
     except Exception:
-        dupes_task = _empty_dupes()
+        from app.ai.search import keyword_search_tickets as _kws
+        async def _keyword_dupes() -> list:
+            rows = await _kws(nl_text, org_id, limit=3)
+            return [
+                {"jira_key": r.get("key"), "summary": r.get("title"),
+                 "status": r.get("status", ""), "similarity": r.get("similarity", 0.5)}
+                for r in rows if r.get("key")
+            ]
+        dupes_task = _keyword_dupes()
 
     fields, dupes = await asyncio.gather(fields_task, dupes_task)
     return {

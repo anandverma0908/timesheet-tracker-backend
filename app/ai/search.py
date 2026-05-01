@@ -198,7 +198,10 @@ async def keyword_search_tickets(query: str, org_id: str, limit: int = 8, pod: O
 
 async def nl_query(query: str, org_id: str, user_context: str = "", pod: Optional[str] = None) -> dict:
     allowed_pods = {pod} if pod else None
-    semantic = await semantic_search(query, org_id, limit=5, allowed_pods=allowed_pods)
+    try:
+        semantic = await semantic_search(query, org_id, limit=5, allowed_pods=allowed_pods)
+    except Exception:
+        semantic = []
     good_semantic = [r for r in semantic if (r.get("similarity") or 0) >= 0.55]
 
     # Always try keyword search in parallel to supplement or replace semantic results
@@ -252,36 +255,59 @@ async def find_similar_tickets(
     db  = SessionLocal()
     emb = str(embedding)
     try:
-        # Vector similarity search
-        rows = db.execute(text("""
-            SELECT t.jira_key, t.summary, t.status,
-                   1 - (te.embedding <=> CAST(:emb AS vector)) as similarity
-            FROM ticket_embeddings te
+        # Check if any embeddings exist for this org
+        count = db.execute(text("""
+            SELECT COUNT(*) FROM ticket_embeddings te
             JOIN jira_tickets t ON te.ticket_id = t.id
-            WHERE t.org_id = :org_id
-              AND t.status != 'Done'
-              AND 1 - (te.embedding <=> CAST(:emb AS vector)) >= :threshold
-            ORDER BY te.embedding <=> CAST(:emb AS vector) LIMIT :limit
-        """), {"emb": emb, "org_id": org_id, "threshold": threshold, "limit": limit}).fetchall()
-        results = [dict(r._mapping) for r in rows]
+            WHERE t.org_id = :org_id AND t.status != 'Done'
+        """), {"org_id": org_id}).scalar()
 
-        if results:
-            logger.info(f"find_similar_tickets: vector search found {len(results)} results (top similarity: {results[0].get('similarity', '?'):.3f})")
-            return results
-
-        # Log top scores even when below threshold (helps tune the threshold)
-        try:
-            top = db.execute(text("""
-                SELECT t.summary, 1 - (te.embedding <=> CAST(:emb AS vector)) as similarity
+        if count and count > 0:
+            # Vector similarity search
+            rows = db.execute(text("""
+                SELECT t.jira_key, t.summary, t.status,
+                       1 - (te.embedding <=> CAST(:emb AS vector)) as similarity
                 FROM ticket_embeddings te
                 JOIN jira_tickets t ON te.ticket_id = t.id
-                WHERE t.org_id = :org_id AND t.status != 'Done'
-                ORDER BY te.embedding <=> CAST(:emb AS vector) LIMIT 3
-            """), {"emb": emb, "org_id": org_id}).fetchall()
-            for r in top:
-                logger.info(f"find_similar_tickets: below-threshold candidate '{r.summary}' similarity={r.similarity:.3f}")
-        except Exception:
-            pass
+                WHERE t.org_id = :org_id
+                  AND t.status != 'Done'
+                  AND 1 - (te.embedding <=> CAST(:emb AS vector)) >= :threshold
+                ORDER BY te.embedding <=> CAST(:emb AS vector) LIMIT :limit
+            """), {"emb": emb, "org_id": org_id, "threshold": threshold, "limit": limit}).fetchall()
+            results = [dict(r._mapping) for r in rows]
+
+            if results:
+                logger.info(f"find_similar_tickets: vector search found {len(results)} results (top similarity: {results[0].get('similarity', '?'):.3f})")
+                return results
+
+            # Log top scores even when below threshold (helps tune the threshold)
+            try:
+                top = db.execute(text("""
+                    SELECT t.summary, 1 - (te.embedding <=> CAST(:emb AS vector)) as similarity
+                    FROM ticket_embeddings te
+                    JOIN jira_tickets t ON te.ticket_id = t.id
+                    WHERE t.org_id = :org_id AND t.status != 'Done'
+                    ORDER BY te.embedding <=> CAST(:emb AS vector) LIMIT 3
+                """), {"emb": emb, "org_id": org_id}).fetchall()
+                for r in top:
+                    logger.info(f"find_similar_tickets: below-threshold candidate '{r.summary}' similarity={r.similarity:.3f}")
+            except Exception:
+                pass
+
+        # Fallback: keyword-based search when embeddings table is empty or vector search misses
+        if query_text:
+            logger.info("find_similar_tickets: falling back to keyword search")
+            keyword_results = await keyword_search_tickets(query_text, org_id, limit=limit)
+            return [
+                {
+                    "jira_key": r.get("key"),
+                    "summary": r.get("title"),
+                    "status": r.get("status", "Unknown"),
+                    "similarity": r.get("similarity", 0.5),
+                }
+                for r in keyword_results
+                if r.get("key")
+            ]
 
         return []
     except Exception as e:

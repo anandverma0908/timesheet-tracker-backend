@@ -50,16 +50,8 @@ os.makedirs(settings.upload_dir, exist_ok=True)
 
 VALID_STATUSES = ["Backlog", "To Do", "In Progress", "In Review", "Done", "Blocked"]
 
-# Allowed forward/back transitions per status.
-# None means any transition is allowed from that status.
-ALLOWED_TRANSITIONS: Dict[str, Optional[List[str]]] = {
-    "Backlog":     ["To Do", "In Progress"],
-    "To Do":       ["In Progress", "Backlog"],
-    "In Progress": ["In Review", "To Do", "Blocked", "Done"],
-    "In Review":   ["In Progress", "Done", "Blocked"],
-    "Blocked":     ["In Progress", "To Do"],
-    "Done":        ["In Progress", "To Do"],  # allow re-open
-}
+# All transitions are allowed — the drag-and-drop board must be able to move freely.
+ALLOWED_TRANSITIONS: Dict[str, Optional[List[str]]] = {}
 VALID_ISSUE_TYPES = {"Story", "Bug", "Task", "Epic", "Subtask", "Improvement"}
 ALLOWED_ATTACHMENT_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp",
@@ -305,7 +297,9 @@ async def create_ticket(
             parent_id = parent.id
 
     epic_id = None
-    if body.epic_key:
+    if body.epic_id:
+        epic_id = body.epic_id
+    elif body.epic_key:
         epic = db.query(JiraTicket).filter(
             JiraTicket.jira_key == body.epic_key,
             JiraTicket.org_id == user.org_id,
@@ -345,17 +339,25 @@ async def create_ticket(
     db.commit()
     db.refresh(ticket)
 
-    # Automation + webhook hooks
+    # Automation + webhook hooks — wrapped so failures don't block the 201 response
+    import logging as _logging
+    _log = _logging.getLogger(__name__)
     from app.services.automation_engine import run_automations
     from app.services.webhook_service import dispatch_event
-    await run_automations("ticket_created", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key}, user.org_id, ticket.pod or "", db)
-    await dispatch_event(user.org_id, "ticket_created", {
-        "ticket_key": ticket.jira_key,
-        "summary": ticket.summary,
-        "assignee": ticket.assignee,
-        "user": user.name,
-        "link": f"/tickets?key={ticket.jira_key}",
-    }, db)
+    try:
+        await run_automations("ticket_created", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key}, user.org_id, ticket.pod or "", db)
+    except Exception as _e:
+        _log.error(f"[automation] run_automations failed for ticket_created {ticket.jira_key}: {_e}")
+    try:
+        await dispatch_event(user.org_id, "ticket_created", {
+            "ticket_key": ticket.jira_key,
+            "summary": ticket.summary,
+            "assignee": ticket.assignee,
+            "user": user.name,
+            "link": f"/tickets?key={ticket.jira_key}",
+        }, db)
+    except Exception as _e:
+        _log.error(f"[webhook] dispatch_event failed for ticket_created {ticket.jira_key}: {_e}")
 
     background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "")
     return TicketOut(**_to_out(ticket, db))
@@ -453,16 +455,20 @@ async def update_ticket(
         if ticket.parent_id != new_parent_id:
             update_data["parent_id"] = new_parent_id
 
+    if "epic_id" in update_data:
+        update_data["epic_id"] = update_data.pop("epic_id")
+
     if "epic_key" in update_data:
         ek = update_data.pop("epic_key")
-        epic = db.query(JiraTicket).filter(
-            JiraTicket.jira_key == ek,
-            JiraTicket.org_id == user.org_id,
-            JiraTicket.is_deleted == False,
-        ).first() if ek else None
-        new_epic_id = epic.id if epic else None
-        if ticket.epic_id != new_epic_id:
-            update_data["epic_id"] = new_epic_id
+        if "epic_id" not in update_data:
+            epic = db.query(JiraTicket).filter(
+                JiraTicket.jira_key == ek,
+                JiraTicket.org_id == user.org_id,
+                JiraTicket.is_deleted == False,
+            ).first() if ek else None
+            new_epic_id = epic.id if epic else None
+            if ticket.epic_id != new_epic_id:
+                update_data["epic_id"] = new_epic_id
 
     diff = {}
     for field, value in update_data.items():
@@ -503,6 +509,24 @@ async def update_ticket(
         db.commit()
         db.refresh(ticket)
         background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "")
+
+        if "status" in diff:
+            import logging as _logging
+            _log = _logging.getLogger(__name__)
+            from app.services.webhook_service import dispatch_event
+            try:
+                sent = await dispatch_event(user.org_id, "status_changed", {
+                    "ticket_key": ticket.jira_key,
+                    "summary":    ticket.summary,
+                    "old_status": diff["status"]["old"],
+                    "new_status": diff["status"]["new"],
+                    "user":       user.name,
+                    "link":       f"/tickets?key={ticket.jira_key}",
+                }, db)
+                _log.info(f"[webhook] status_changed dispatched to {sent} integration(s) for {ticket.jira_key}")
+            except Exception as _e:
+                _log.error(f"[webhook] dispatch_event failed for status_changed: {_e}")
+
     return TicketOut(**_to_out(ticket, db))
 
 
@@ -527,6 +551,9 @@ async def transition_status(
     db:   Session = Depends(get_db),
     user: User    = Depends(get_current_user),
 ):
+    import logging as _log_ts
+    import traceback as _tb
+    _logger_ts = _log_ts.getLogger(__name__)
     if body.status not in VALID_STATUSES:
         raise HTTPException(400, f"Invalid status. Must be one of: {VALID_STATUSES}")
 
@@ -548,29 +575,43 @@ async def transition_status(
         "old": old_status, "new": body.status
     })
 
-    if body.status == "Blocked" and ticket.assignee:
+    if ticket.assignee:
         from app.models.notification import Notification as Notif
         from app.models.base import gen_uuid as _gen
-        assignee_user = db.query(User).filter(
-            User.org_id == user.org_id,
-            User.name == ticket.assignee,
-        ).first()
-        if assignee_user:
-            db.add(Notif(
-                id=_gen(), org_id=user.org_id, user_id=assignee_user.id,
-                type="blocked_ticket",
-                title=f"{ticket.jira_key} has been blocked",
-                body=ticket.summary[:200],
-                link=f"/tickets?key={ticket.jira_key}",
-            ))
+        STATUS_NOTIF = {
+            "Blocked":     ("blocked_ticket",    f"{ticket.jira_key} has been blocked"),
+            "Done":        ("ticket_done",        f"{ticket.jira_key} marked Done"),
+            "In Progress": ("ticket_in_progress", f"{ticket.jira_key} is now In Progress"),
+            "In Review":   ("ticket_in_review",   f"{ticket.jira_key} is ready for review"),
+        }
+        if body.status in STATUS_NOTIF:
+            assignee_user = db.query(User).filter(
+                User.org_id == user.org_id,
+                User.name == ticket.assignee,
+            ).first()
+            if assignee_user and assignee_user.id != user.id:
+                notif_type, notif_title = STATUS_NOTIF[body.status]
+                db.add(Notif(
+                    id=_gen(), org_id=user.org_id, user_id=assignee_user.id,
+                    type=notif_type,
+                    title=notif_title,
+                    body=ticket.summary[:200],
+                    link=f"/tickets?key={ticket.jira_key}",
+                ))
 
-    db.commit()
-    db.refresh(ticket)
+    try:
+        db.commit()
+        db.refresh(ticket)
+    except Exception as _e:
+        db.rollback()
+        _logger_ts.error(f"[transition_status] db.commit failed for {ticket_id}: {_e}\n{_tb.format_exc()}")
+        raise HTTPException(500, f"Failed to save status change: {_e}")
     from app.services.automation_engine import run_automations
     from app.services.webhook_service import dispatch_event
-    import logging as _logging
-    _log = _logging.getLogger(__name__)
-    await run_automations("status_change", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key, "old_status": old_status, "new_status": body.status}, user.org_id, ticket.pod or "", db)
+    try:
+        await run_automations("status_change", {"ticket_id": ticket.id, "ticket_key": ticket.jira_key, "old_status": old_status, "new_status": body.status}, user.org_id, ticket.pod or "", db)
+    except Exception as _e:
+        _logger_ts.error(f"[automation] run_automations failed for status_change {ticket.jira_key}: {_e}")
     try:
         sent = await dispatch_event(user.org_id, "status_changed", {
             "ticket_key": ticket.jira_key,
@@ -580,10 +621,14 @@ async def transition_status(
             "user": user.name,
             "link": f"/tickets?key={ticket.jira_key}",
         }, db)
-        _log.info(f"[webhook] status_changed dispatched to {sent} integration(s) for {ticket.jira_key}")
+        _logger_ts.info(f"[webhook] status_changed dispatched to {sent} integration(s) for {ticket.jira_key}")
     except Exception as _e:
-        _log.error(f"[webhook] dispatch_event failed for status_changed: {_e}")
-    return TicketOut(**_to_out(ticket, db))
+        _logger_ts.error(f"[webhook] dispatch_event failed for status_changed: {_e}")
+    try:
+        return TicketOut(**_to_out(ticket, db))
+    except Exception as _e:
+        _logger_ts.error(f"[transition_status] serialization failed for {ticket_id}: {_e}\n{_tb.format_exc()}")
+        raise HTTPException(500, f"Status updated but response serialization failed: {_e}")
 
 
 # ── COMMENTS ─────────────────────────────────────────────────────────────────

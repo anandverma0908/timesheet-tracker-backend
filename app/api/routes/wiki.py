@@ -461,8 +461,10 @@ async def restore_version(
         author_id=manager.id,
     ))
 
+    from app.models.base import now as _now
     page.content_md = ver.content_md
     page.version   += 1
+    page.updated_at = _now()
     db.commit()
     db.refresh(page)
 

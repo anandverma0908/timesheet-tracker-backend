@@ -25,6 +25,7 @@ class TicketCreate(BaseModel):
     due_date:                   Optional[date] = None
     parent_key:                 Optional[str] = None
     epic_key:                   Optional[str] = None
+    epic_id:                    Optional[str] = None
     fix_version:                Optional[str] = None
     original_estimate_hours:    Optional[float] = None
     remaining_estimate_hours:   Optional[float] = None
@@ -85,6 +86,7 @@ class TicketUpdate(BaseModel):
     custom_fields:              Optional[dict] = None
     parent_key:                 Optional[str] = None
     epic_key:                   Optional[str] = None
+    epic_id:                    Optional[str] = None
     fix_version:                Optional[str] = None
     original_estimate_hours:    Optional[float] = None
     remaining_estimate_hours:   Optional[float] = None

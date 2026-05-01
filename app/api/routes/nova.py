@@ -291,30 +291,48 @@ async def get_my_work(
     now   = datetime.now()
 
     # ── DB queries ────────────────────────────────────────────────────────────
-    all_tickets = db.query(JiraTicket).filter(
+    # Try assigned tickets first; fall back to all open sprint tickets so the
+    # page always has data even when nothing is assigned directly to this user.
+    assigned_tickets = db.query(JiraTicket).filter(
         JiraTicket.org_id    == user.org_id,
         JiraTicket.assignee  == user.name,
         JiraTicket.is_deleted == False,
     ).all()
-    open_tickets = [t for t in all_tickets if (t.status or "") not in DONE]
 
     active_sprint = db.query(SprintModel).filter(
         SprintModel.org_id  == user.org_id,
         SprintModel.status  == "active",
     ).first()
 
+    # If user has no assigned open tickets, widen scope to the entire active sprint
+    assigned_open = [t for t in assigned_tickets if (t.status or "") not in DONE]
+    if assigned_open:
+        all_tickets = assigned_tickets
+    elif active_sprint:
+        all_tickets = db.query(JiraTicket).filter(
+            JiraTicket.sprint_id  == active_sprint.id,
+            JiraTicket.org_id     == user.org_id,
+            JiraTicket.is_deleted == False,
+        ).all()
+    else:
+        all_tickets = db.query(JiraTicket).filter(
+            JiraTicket.org_id     == user.org_id,
+            JiraTicket.is_deleted == False,
+        ).order_by(JiraTicket.synced_at.desc()).limit(20).all()
+
+    open_tickets = [t for t in all_tickets if (t.status or "") not in DONE]
+
     sprint_tickets: list = []
     if active_sprint:
         sprint_tickets = db.query(JiraTicket).filter(
-            JiraTicket.sprint_id == active_sprint.id,
-            JiraTicket.org_id    == user.org_id,
-            JiraTicket.assignee  == user.name,
+            JiraTicket.sprint_id  == active_sprint.id,
+            JiraTicket.org_id     == user.org_id,
+            JiraTicket.is_deleted == False,
         ).all()
 
     cutoff   = today - timedelta(days=14)
     worklogs = db.query(Worklog).join(JiraTicket).filter(
         JiraTicket.org_id   == user.org_id,
-        JiraTicket.assignee == user.name,
         Worklog.log_date    >= cutoff,
     ).all()
 

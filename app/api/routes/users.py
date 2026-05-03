@@ -12,7 +12,7 @@ from app.core.dependencies import get_current_user, get_admin, require_roles
 get_admin_or_manager = require_roles("admin", "engineering_manager")
 from app.core.security import hash_password
 from app.models.user import User
-from app.schemas.auth import UserOut
+from app.schemas.auth import UserOut, UserUpdateRequest
 
 router = APIRouter(prefix="/api/users", tags=["users"])
 
@@ -64,6 +64,30 @@ async def get_user(
     target = db.query(User).filter(User.id == user_id, User.org_id == actor.org_id).first()
     if not target:
         raise HTTPException(404, "User not found")
+    return UserOut.model_validate(target)
+
+
+VALID_ROLES = {"admin", "engineering_manager", "tech_lead", "team_member", "finance_viewer"}
+
+
+@router.put("/{user_id}", response_model=UserOut)
+async def update_user(
+    user_id: str,
+    body:    UserUpdateRequest,
+    db:      Session = Depends(get_db),
+    admin:   User    = Depends(get_admin_or_manager),
+):
+    target = db.query(User).filter(User.id == user_id, User.org_id == admin.org_id).first()
+    if not target:
+        raise HTTPException(404, "User not found")
+    if body.role is not None:
+        if body.role not in VALID_ROLES:
+            raise HTTPException(400, f"Invalid role: {body.role}")
+        target.role = body.role
+    if body.pod is not None:
+        target.pod = body.pod or None
+    db.commit()
+    db.refresh(target)
     return UserOut.model_validate(target)
 
 

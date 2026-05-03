@@ -180,9 +180,17 @@ async def list_spaces(
     sprint_by_pod = {s.pod: s for s in all_active_sprints}
     hours_by_pod  = {pod: round(float(h or 0), 2) for pod, h in hours_rows}
 
-    all_pods = sorted(
+    manager_roles = {"admin", "engineering_manager"}
+    user_pods = set()
+    if user.role not in manager_roles and user.pod:
+        user_pods = {p.strip() for p in user.pod.split(",") if p.strip()}
+
+    all_pods_raw = sorted(
         {p for p in list(tickets_by_pod.keys()) + [p for (p,) in sprint_pods] if (p or "").strip()}
     )
+    all_pods = all_pods_raw if user.role in manager_roles or not user_pods else [
+        p for p in all_pods_raw if p in user_pods
+    ]
 
     done_keys = {"done", "closed", "resolved"}
     result = []
@@ -722,6 +730,22 @@ async def get_space_epics(
     return result
 
 
+def _sync_user_pod(db: Session, user_id: str, org_id: str) -> None:
+    """Rebuild user.pod from the space_members table and persist it."""
+    from app.models.space_member import SpaceMember
+    from app.models.user import User as UserModel
+
+    pods = (
+        db.query(SpaceMember.pod)
+        .filter(SpaceMember.user_id == user_id, SpaceMember.org_id == org_id)
+        .all()
+    )
+    pod_str = ",".join(sorted({p for (p,) in pods if p})) or None
+    db.query(UserModel).filter(UserModel.id == user_id, UserModel.org_id == org_id).update(
+        {"pod": pod_str}, synchronize_session=False
+    )
+
+
 @router.post("")
 async def create_space(
     payload: SpaceCreatePayload,
@@ -773,6 +797,9 @@ async def create_space(
             role="lead" if i == 0 else "member",
         ))
 
+    db.commit()
+    for uid in seen:
+        _sync_user_pod(db, uid, org_id)
     db.commit()
     return {"pod": pod, "name": payload.name, "status": "created", "member_count": len(seen)}
 
@@ -831,6 +858,8 @@ async def add_space_member(
 
     db.add(SpaceMember(org_id=user.org_id, pod=pod, user_id=body.user_id, role=body.role))
     db.commit()
+    _sync_user_pod(db, body.user_id, user.org_id)
+    db.commit()
     return {"status": "added"}
 
 
@@ -852,7 +881,10 @@ async def remove_space_member(
     if not row:
         raise HTTPException(404, "Member not found")
 
+    removed_user_id = row.user_id
     db.delete(row)
+    db.commit()
+    _sync_user_pod(db, removed_user_id, user.org_id)
     db.commit()
     return {"status": "removed"}
 

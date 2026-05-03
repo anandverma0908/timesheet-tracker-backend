@@ -23,7 +23,7 @@ from app.core.config import settings
 
 _BASE = "https://api.github.com"
 _TIMEOUT = 12.0
-_MAX_FILE_CANDIDATES = 24
+_MAX_FILE_CANDIDATES = 60
 _MAX_PRS = 8
 _MAX_FILE_BYTES = 300_000
 _MAX_FILE_CHARS = 24_000
@@ -366,15 +366,21 @@ def _read_text_file(path: Path) -> str:
 
 def _extract_symbols(snippet: str) -> list[str]:
     patterns = [
+        # JS / TS
         r"(?:export\s+default\s+function|export\s+function|function)\s+([A-Za-z_][A-Za-z0-9_]*)",
-        r"(?:export\s+class|class)\s+([A-Za-z_][A-Za-z0-9_]*)",
+        r"(?:export\s+(?:default\s+)?class|class)\s+([A-Za-z_][A-Za-z0-9_]*)",
         r"(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(?:async\s*)?\(",
+        # Python
+        r"^(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)",
+        r"^class\s+([A-Za-z_][A-Za-z0-9_]*)",
+        # Java / Kotlin / Go
+        r"(?:public|private|protected|internal|fun|func)\s+(?:static\s+)?(?:\w+\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*\(",
     ]
     symbols: list[str] = []
     for pattern in patterns:
-        for match in re.finditer(pattern, snippet):
+        for match in re.finditer(pattern, snippet, re.MULTILINE):
             symbols.append(match.group(1))
-    return _dedupe_terms(symbols)[:8]
+    return _dedupe_terms(symbols)[:12]
 
 
 def _build_repo_index(source: RepoSource) -> list[dict[str, Any]]:

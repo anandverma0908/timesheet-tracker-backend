@@ -29,6 +29,11 @@ class UserOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class UserUpdateRequest(BaseModel):
+    role: Optional[str] = None
+    pod:  Optional[str] = None
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type:   str = "bearer"

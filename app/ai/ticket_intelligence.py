@@ -47,13 +47,23 @@ async def _empty_dupes() -> list:
 
 async def full_analysis(nl_text: str, org_id: str, available_users: list = []) -> dict:
     """Full agentic pipeline: classify + duplicate check in parallel."""
+    from app.ai.search import _build_ticket_content
+
     fields_task = analyse_ticket(nl_text, available_users)
 
     # Embedding may fail if sentence_transformers is unavailable or not yet indexed —
     # degrade gracefully: try vector search first, fall back to keyword search.
     try:
+        # Use the same enriched content format as stored embeddings for accurate comparison
+        # We don't have pod/type yet (fields not resolved), so embed raw NL text for now.
+        # After fields resolve we re-embed with enriched content in the background task.
         init_embed = embed(nl_text)
-        dupes_task = find_similar_tickets(init_embed, org_id, threshold=0.55, limit=3, query_text=nl_text)
+        dupes_task = find_similar_tickets(
+            init_embed, org_id,
+            threshold=0.50,   # lower net — LLM filters false positives in uncertain band
+            limit=3,
+            query_text=nl_text,
+        )
     except Exception:
         from app.ai.search import keyword_search_tickets as _kws
         async def _keyword_dupes() -> list:

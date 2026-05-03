@@ -6,6 +6,7 @@ so all vector casts use CAST(:param AS vector) instead of :param::vector.
 """
 
 import re
+import json
 import logging
 from typing import Optional
 from sqlalchemy import text
@@ -83,7 +84,7 @@ async def semantic_search(
         except Exception:
             wiki = []
 
-        all_results = [dict(r._mapping) for r in list(tickets) + list(wiki)]
+        all_results = [{**dict(r._mapping), "similarity": float(r.similarity)} for r in list(tickets) + list(wiki)]
     finally:
         db.close()
 
@@ -166,7 +167,7 @@ async def keyword_search_tickets(query: str, org_id: str, limit: int = 8, pod: O
             LIMIT :limit
         """), params).fetchall()
 
-        results = [dict(r._mapping) for r in rows]
+        results = [{**dict(r._mapping), "similarity": float(r.similarity)} for r in rows]
 
         # If strict AND+type filter found nothing, relax to OR across terms (keep type filter)
         if not results and terms:
@@ -192,7 +193,7 @@ async def keyword_search_tickets(query: str, org_id: str, limit: int = 8, pod: O
                   CASE t.priority WHEN 'Highest' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 ELSE 3 END
                 LIMIT :limit
             """), params).fetchall()
-            results = [dict(r._mapping) for r in rows]
+            results = [{**dict(r._mapping), "similarity": float(r.similarity)} for r in rows]
 
         return results
     except Exception:
@@ -250,17 +251,72 @@ async def nl_query(query: str, org_id: str, user_context: str = "", pod: Optiona
     return {"answer": answer, "sources": results}
 
 
+_DUPE_THRESHOLD_CERTAIN   = 0.65   # above this → confirmed duplicate
+_DUPE_THRESHOLD_UNCERTAIN = 0.50   # 0.50–0.65 → send to LLM for confirmation
+_DUPE_SIMILARITY_LOG_TABLE = "duplicate_similarity_log"
+
+
+async def _llm_confirm_duplicates(query_text: str, candidates: list[dict]) -> list[dict]:
+    """Ask LLM to confirm which candidates in the uncertain band are true duplicates."""
+    from app.ai.nova import chat
+    numbered = "\n".join(
+        f"{i+1}. [{c['jira_key']}] {c['summary']} (status: {c['status']})"
+        for i, c in enumerate(candidates)
+    )
+    prompt = f"""You are a duplicate ticket detector. Given a new ticket and a list of existing tickets, identify which existing tickets are true duplicates (same issue, same root cause).
+
+New ticket:
+{query_text}
+
+Existing candidates:
+{numbered}
+
+Reply with ONLY a JSON array of the numbers that are true duplicates. Example: [1, 3]
+If none are duplicates, reply: []"""
+    try:
+        raw = await chat(prompt, temperature=0, max_tokens=60)
+        match = re.search(r"\[.*?\]", raw, re.DOTALL)
+        if match:
+            indices = json.loads(match.group(0))
+            return [candidates[i - 1] for i in indices if isinstance(i, int) and 1 <= i <= len(candidates)]
+    except Exception as e:
+        logger.warning(f"LLM duplicate confirmation failed: {e}")
+    return []
+
+
+def _log_similarity_scores(org_id: str, query_text: str, candidates: list) -> None:
+    """Persist similarity scores for threshold calibration."""
+    try:
+        db = SessionLocal()
+        for row in candidates:
+            db.execute(text("""
+                INSERT INTO duplicate_similarity_log
+                    (id, org_id, query_snippet, jira_key, similarity, created_at)
+                VALUES
+                    (gen_random_uuid(), :org_id, :query, :key, :sim, NOW())
+                ON CONFLICT DO NOTHING
+            """), {
+                "org_id": org_id,
+                "query":  query_text[:200],
+                "key":    row.jira_key,
+                "sim":    float(row.similarity),
+            })
+        db.commit()
+        db.close()
+    except Exception:
+        pass  # log table may not exist yet — never block the main flow
+
+
 async def find_similar_tickets(
     embedding: list[float],
     org_id: str,
-    threshold: float = 0.58,
+    threshold: float = 0.50,   # lowered from 0.58 — LLM filters false positives
     limit: int = 3,
     query_text: str = "",
 ) -> list[dict]:
     db  = SessionLocal()
     emb = str(embedding)
     try:
-        # Check if any embeddings exist for this org
         count = db.execute(text("""
             SELECT COUNT(*) FROM ticket_embeddings te
             JOIN jira_tickets t ON te.ticket_id = t.id
@@ -268,7 +324,7 @@ async def find_similar_tickets(
         """), {"org_id": org_id}).scalar()
 
         if count and count > 0:
-            # Vector similarity search
+            # Fetch candidates at the lower threshold (wider net)
             rows = db.execute(text("""
                 SELECT t.jira_key, t.summary, t.status,
                        1 - (te.embedding <=> CAST(:emb AS vector)) as similarity
@@ -278,40 +334,53 @@ async def find_similar_tickets(
                   AND t.status != 'Done'
                   AND 1 - (te.embedding <=> CAST(:emb AS vector)) >= :threshold
                 ORDER BY te.embedding <=> CAST(:emb AS vector) LIMIT :limit
-            """), {"emb": emb, "org_id": org_id, "threshold": threshold, "limit": limit}).fetchall()
-            results = [dict(r._mapping) for r in rows]
+            """), {"emb": emb, "org_id": org_id, "threshold": threshold, "limit": limit * 3}).fetchall()
 
-            if results:
-                logger.info(f"find_similar_tickets: vector search found {len(results)} results (top similarity: {results[0].get('similarity', '?'):.3f})")
-                return results
-
-            # Log top scores even when below threshold (helps tune the threshold)
+            # Always log top candidates for calibration
             try:
-                top = db.execute(text("""
-                    SELECT t.summary, 1 - (te.embedding <=> CAST(:emb AS vector)) as similarity
+                top_all = db.execute(text("""
+                    SELECT t.jira_key, t.summary, 1 - (te.embedding <=> CAST(:emb AS vector)) as similarity
                     FROM ticket_embeddings te
                     JOIN jira_tickets t ON te.ticket_id = t.id
                     WHERE t.org_id = :org_id AND t.status != 'Done'
-                    ORDER BY te.embedding <=> CAST(:emb AS vector) LIMIT 3
+                    ORDER BY te.embedding <=> CAST(:emb AS vector) LIMIT 5
                 """), {"emb": emb, "org_id": org_id}).fetchall()
-                for r in top:
-                    logger.info(f"find_similar_tickets: below-threshold candidate '{r.summary}' similarity={r.similarity:.3f}")
+                for r in top_all:
+                    logger.info(f"[similarity] '{r.summary[:60]}' score={r.similarity:.4f}")
+                _log_similarity_scores(org_id, query_text, top_all)
             except Exception:
                 pass
 
-        # Fallback: keyword-based search when embeddings table is empty or vector search misses
+            if rows:
+                rows_dicts = [{**dict(r._mapping), "similarity": float(r.similarity)} for r in rows]
+                certain   = [r for r in rows_dicts if r["similarity"] >= _DUPE_THRESHOLD_CERTAIN]
+                uncertain = [r for r in rows_dicts if _DUPE_THRESHOLD_UNCERTAIN <= r["similarity"] < _DUPE_THRESHOLD_CERTAIN]
+
+                logger.info(f"[duplicacy] certain={len(certain)} uncertain={len(uncertain)}")
+
+                # Confirmed high-confidence duplicates pass through directly
+                confirmed = list(certain)
+
+                # Uncertain band → LLM decides
+                if uncertain and query_text:
+                    llm_confirmed = await _llm_confirm_duplicates(query_text, uncertain)
+                    confirmed.extend(llm_confirmed)
+
+                if confirmed:
+                    return confirmed[:limit]
+
+        # Fallback: keyword search
         if query_text:
             logger.info("find_similar_tickets: falling back to keyword search")
             keyword_results = await keyword_search_tickets(query_text, org_id, limit=limit)
             return [
                 {
-                    "jira_key": r.get("key"),
-                    "summary": r.get("title"),
-                    "status": r.get("status", "Unknown"),
+                    "jira_key":  r.get("key"),
+                    "summary":   r.get("title"),
+                    "status":    r.get("status", "Unknown"),
                     "similarity": r.get("similarity", 0.5),
                 }
-                for r in keyword_results
-                if r.get("key")
+                for r in keyword_results if r.get("key")
             ]
 
         return []
@@ -322,9 +391,29 @@ async def find_similar_tickets(
         db.close()
 
 
-async def embed_and_store_ticket(ticket_id: str, title: str, description: str, db) -> None:
+def _build_ticket_content(title: str, description: str, issue_type: str = "", pod: str = "") -> str:
+    """Build the text that gets embedded — richer context = more accurate similarity."""
+    parts = []
+    if issue_type:
+        parts.append(f"Type: {issue_type}")
+    if pod:
+        parts.append(f"Pod: {pod}")
+    parts.append(f"Title: {title}")
+    if description:
+        parts.append(f"Description: {description}")
+    return "\n".join(parts)
+
+
+async def embed_and_store_ticket(
+    ticket_id: str,
+    title: str,
+    description: str,
+    db,
+    issue_type: str = "",
+    pod: str = "",
+) -> None:
     from app.ai.nova import embed as nova_embed
-    content   = f"{title}\n{description or ''}"
+    content   = _build_ticket_content(title, description, issue_type, pod)
     embedding = str(nova_embed(content))
     db.execute(text("""
         INSERT INTO ticket_embeddings (id, ticket_id, embedding, content_snippet, updated_at)

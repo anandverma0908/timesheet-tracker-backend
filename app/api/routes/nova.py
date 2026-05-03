@@ -12,7 +12,7 @@ Endpoints:
   GET  /api/nova/standup/today           Get own standup for today
   GET  /api/nova/standup/team            Get all team standups (manager+)
   PUT  /api/nova/standup/:id             Edit own standup
-  GET  /api/nova/knowledge-gaps          List detected knowledge gaps (PM+)
+  GET  /api/nova/knowledge-gaps          List detected knowledge gaps (all authenticated users)
   POST /api/nova/spaces-brief/:pod       EOS Project Brief for SummaryTab (3 insight signals)
   GET  /api/nova/self-org                Self-organisation suggestions across pods
   POST /api/nova/sprint-draft/:pod       AI-drafted sprint backlog for a pod
@@ -28,7 +28,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.dependencies import get_current_user, get_manager_up
+from app.core.dependencies import get_current_user, get_manager_up, get_tech_lead_up
 from app.core.config import settings
 from app.models.user import User
 from app.schemas.search import NovaQueryRequest, NovaQueryOut
@@ -758,15 +758,19 @@ async def get_my_standup_by_date(
 async def get_team_standups(
     standup_date: Optional[str] = Query(None, description="ISO date, defaults to today"),
     db:   Session = Depends(get_db),
-    user: User    = Depends(get_manager_up),
+    user: User    = Depends(get_tech_lead_up),
 ):
-    """Return all team standups for a given date (managers and above)."""
+    """Return team standups for a given date.
+    - admin: sees everyone (except other admins)
+    - engineering_manager: sees direct reports (reporting_to == their name/emp_no/id)
+    - tech_lead: sees pod-mates
+    """
     from app.models.sprint import Standup
     from app.models.user import User as UserModel
 
     target_date = date.fromisoformat(standup_date) if standup_date else date.today()
 
-    # Admins are excluded from team standup views entirely
+    # Exclude admin accounts from the view
     admin_ids = [
         u.id for u in db.query(UserModel).filter(
             UserModel.org_id == user.org_id,
@@ -774,17 +778,33 @@ async def get_team_standups(
         ).all()
     ]
 
-    # Managers only see standups of their direct reports
-    if user.role == "engineering_manager":
+    if user.role == "admin":
+        visible_user_ids = None  # sees everyone
+
+    elif user.role == "engineering_manager":
+        # reporting_to stores name, emp_no, or id — match any
+        manager_identifiers = [v for v in [user.name, user.emp_no, str(user.id)] if v]
         visible_user_ids = [
             u.id for u in db.query(UserModel).filter(
-                UserModel.org_id      == user.org_id,
-                UserModel.reporting_to == str(user.id),
+                UserModel.org_id == user.org_id,
+                UserModel.reporting_to.in_(manager_identifiers),
             ).all()
         ]
-    else:
-        # Admin role (get_manager_up allows admin too) — sees everyone except other admins
-        visible_user_ids = None
+        # Always include own standup
+        visible_user_ids.append(str(user.id))
+
+    else:  # tech_lead — pod-mates
+        user_pods = [p.strip() for p in (user.pod or "").split(",") if p.strip()]
+        if user_pods:
+            pod_members = db.query(UserModel).filter(
+                UserModel.org_id == user.org_id,
+            ).all()
+            visible_user_ids = [
+                u.id for u in pod_members
+                if any(p in [q.strip() for q in (u.pod or "").split(",") if q.strip()] for p in user_pods)
+            ]
+        else:
+            visible_user_ids = [str(user.id)]
 
     query = db.query(Standup).filter(
         Standup.org_id == user.org_id,
@@ -792,25 +812,32 @@ async def get_team_standups(
         ~Standup.user_id.in_(admin_ids),
     )
     if visible_user_ids is not None:
-        # Manager sees their own standup + direct reports
-        query = query.filter(Standup.user_id.in_(visible_user_ids + [user.id]))
+        query = query.filter(Standup.user_id.in_(visible_user_ids))
 
     standups = query.all()
 
+    # Bulk-load members to avoid N+1
+    member_ids = [s.user_id for s in standups]
+    members_map = {
+        str(u.id): u
+        for u in db.query(UserModel).filter(UserModel.id.in_(member_ids)).all()
+    }
+
     result = []
     for s in standups:
-        member = db.query(UserModel).filter(UserModel.id == s.user_id).first()
+        member = members_map.get(str(s.user_id))
         result.append({
             "id":             s.id,
             "user_id":        s.user_id,
-            "engineer":       member.name if member else None,
+            "engineer":       member.name  if member else None,
             "engineer_email": member.email if member else None,
-            "pod":            member.pod  if member else None,
+            "pod":            member.pod   if member else None,
             "date":           s.date.isoformat(),
-            "yesterday":      s.yesterday,
-            "today":          s.today,
-            "blockers":       s.blockers,
+            "yesterday":      s.yesterday  or "",
+            "today":          s.today      or "",
+            "blockers":       s.blockers   or "",
             "shared":         s.is_shared,
+            "created_at":     s.generated_at.isoformat() if s.generated_at else "",
         })
 
     return {"date": target_date.isoformat(), "standups": result}
@@ -846,21 +873,27 @@ async def update_standup(
     db.commit()
     db.refresh(standup)
 
+    u = standup.user
     return {
-        "id":        standup.id,
-        "user_id":   standup.user_id,
-        "date":      standup.date.isoformat(),
-        "yesterday": standup.yesterday,
-        "today":     standup.today,
-        "blockers":  standup.blockers,
-        "is_shared": standup.is_shared,
+        "id":             standup.id,
+        "user_id":        standup.user_id,
+        "engineer":       u.name  if u else "",
+        "engineer_email": u.email if u else "",
+        "pod":            u.pod   if u else "",
+        "date":           standup.date.isoformat(),
+        "yesterday":      standup.yesterday or "",
+        "today":          standup.today     or "",
+        "blockers":       standup.blockers  or "",
+        "shared":         standup.is_shared,
+        "is_shared":      standup.is_shared,
+        "created_at":     standup.generated_at.isoformat() if standup.generated_at else "",
     }
 
 
 @router.get("/knowledge-gaps")
 async def knowledge_gaps(
     db:   Session = Depends(get_db),
-    user: User    = Depends(get_manager_up),
+    user: User    = Depends(get_current_user),
 ):
     """Return detected knowledge gaps for the org (latest run)."""
     from app.models.sprint import KnowledgeGap

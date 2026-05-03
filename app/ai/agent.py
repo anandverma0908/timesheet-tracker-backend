@@ -82,7 +82,7 @@ def _normalize_status(raw: str) -> str:
     return _STATUS_ALIASES.get(raw.strip().lower(), raw.strip())
 
 
-AGENT_SYSTEM_PROMPT = """You are NOVA/EOS — the intelligent AI operating system of the Trackly platform. You are concise, precise, slightly futuristic. Never verbose.
+AGENT_SYSTEM_PROMPT = """You are EOS — the intelligent AI operating system of the Trackly platform. You are concise, precise, slightly futuristic, and warm. Think JARVIS but female. Never verbose.
 
 === HOW TO RESPOND ===
 
@@ -98,7 +98,7 @@ Do NOT start your response with any label like "MODE", "Status", "FINAL ANSWER" 
 === STRICT RULES ===
 
 1. NEVER guess, fabricate, or invent ticket keys, names, or data. If you have not called a tool yet, you do not know the answer.
-2. ALWAYS call a tool first when the user asks about tickets, sprints, blockers, decisions, or wiki — you cannot answer from memory.
+2. ALWAYS call a tool first when the user asks about tickets, sprints, blockers, decisions, wiki, standup, or timesheet.
 3. Once you have tool results in context, write your answer immediately. Do not call the same tool again.
 4. For greetings or small talk only, reply directly without tools.
 
@@ -118,6 +118,11 @@ rag_query — Ask a natural-language question against the full knowledge index.
   Parameters: question (string)
   Use for: summaries, synthesis, "what did we decide about X"
 
+get_timesheet — Fetch the current user's timesheet (worklogs + manual entries).
+  Parameters: days (int, default 14) — how many past calendar days to look back
+  Use for: ANY question about time logged, hours, timesheet, missing days, daily hours
+  Returns: per-day breakdown, total hours, list of days with no time logged
+
 create_ticket — Create a new ticket. Only when user explicitly asks.
   Parameters: title (string), description (string), priority (string), issue_type (string)
 
@@ -131,6 +136,12 @@ generate_standup — Generate today's standup from recent activity.
 
 User: "what tickets are open right now?"
 Your response: {{"action": "search", "parameters": {{"query": "open", "scope": "tickets"}}, "reasoning": "search all tickets"}}
+
+User: "how many days have I not logged time?"
+Your response: {{"action": "get_timesheet", "parameters": {{"days": 14}}, "reasoning": "fetch timesheet to find unlogged days"}}
+
+User: "show me my timesheet last week"
+Your response: {{"action": "get_timesheet", "parameters": {{"days": 7}}, "reasoning": "fetch last 7 days of timesheet"}}
 
 User: "what is TRKLY-5?"
 Your response: {{"action": "get_ticket", "parameters": {{"key": "TRKLY-5"}}, "reasoning": "fetch ticket by key"}}
@@ -157,6 +168,7 @@ def _build_iteration_prompt(
             content = str(h.get("content", ""))[:600]
             parts.append(f"[{role}] {content}")
 
+    successful_tools: set[str] = set()
     if steps:
         parts.append("\nACTIONS TAKEN SO FAR:")
         for i, s in enumerate(steps):
@@ -165,7 +177,8 @@ def _build_iteration_prompt(
                 continue
             tr = s.get("tool_result", {})
             if tr.get("success"):
-                result_str = json.dumps(tr.get("data", ""))[:600]
+                result_str = json.dumps(tr.get("data", ""))[:800]
+                successful_tools.add(tc["action"])
             else:
                 result_str = f"ERROR: {tr.get('error', 'unknown error')}"
             params_str = json.dumps(tc.get("parameters", {}))[:200]
@@ -173,9 +186,18 @@ def _build_iteration_prompt(
                 f"Step {i + 1}: called {tc['action']}({params_str})\n"
                 f"  Result: {result_str}"
             )
-        parts.append(
-            "\nContinue: either call the next tool OR provide your final plain-text answer."
-        )
+
+        if successful_tools:
+            parts.append(
+                "\n⚠️  YOU ALREADY HAVE DATA FROM: "
+                + ", ".join(successful_tools)
+                + ".\nDo NOT call any of these tools again. "
+                  "Write your FINAL ANSWER now as plain text. No JSON. No tool calls."
+            )
+        else:
+            parts.append(
+                "\nContinue: either call the next tool OR provide your final plain-text answer."
+            )
 
     return "\n".join(parts)
 
@@ -457,6 +479,83 @@ async def _tool_create_wiki_page(params: dict, user: User, db: Session) -> dict:
     }
 
 
+async def _tool_get_timesheet(params: dict, user: User, db: Session) -> dict:
+    from datetime import timedelta
+    from app.models.ticket import Worklog, JiraTicket
+    from app.models.manual_entry import ManualEntry
+
+    days = max(1, min(int(params.get("days", 14)), 60))
+    today = date.today()
+    date_from = today - timedelta(days=days - 1)
+
+    # ── 1. Ticket worklogs ────────────────────────────────────────────────────
+    worklogs = (
+        db.query(Worklog, JiraTicket)
+        .join(JiraTicket, Worklog.ticket_id == JiraTicket.id)
+        .filter(
+            Worklog.author_email == user.email,
+            Worklog.log_date >= date_from,
+            Worklog.log_date <= today,
+            JiraTicket.is_deleted == False,
+        )
+        .all()
+    )
+
+    # ── 2. Manual entries ─────────────────────────────────────────────────────
+    manual = (
+        db.query(ManualEntry)
+        .filter(
+            ManualEntry.user_id == user.id,
+            ManualEntry.entry_date >= date_from,
+            ManualEntry.entry_date <= today,
+        )
+        .all()
+    )
+
+    # Build per-day buckets (only weekdays)
+    all_weekdays = []
+    d = date_from
+    while d <= today:
+        if d.weekday() < 5:  # Mon–Fri
+            all_weekdays.append(d)
+        d += timedelta(days=1)
+
+    hours_by_day: dict[str, float] = {d.isoformat(): 0.0 for d in all_weekdays}
+    entries_by_day: dict[str, list] = {d.isoformat(): [] for d in all_weekdays}
+
+    for wl, ticket in worklogs:
+        k = wl.log_date.isoformat()
+        if k in hours_by_day:
+            hours_by_day[k] += float(wl.hours or 0)
+            entries_by_day[k].append({"activity": ticket.summary, "hours": float(wl.hours or 0), "source": "ticket"})
+
+    for me in manual:
+        k = me.entry_date.isoformat()
+        if k in hours_by_day:
+            hours_by_day[k] += float(me.hours or 0)
+            entries_by_day[k].append({"activity": me.activity, "hours": float(me.hours or 0), "source": "manual"})
+
+    unlogged_days = [d for d, h in hours_by_day.items() if h == 0]
+    low_days = [d for d, h in hours_by_day.items() if 0 < h < 4]
+    total_hours = sum(hours_by_day.values())
+
+    day_summary = [
+        {"date": d, "hours": round(hours_by_day[d], 2), "entries": entries_by_day[d]}
+        for d in sorted(hours_by_day.keys())
+    ]
+
+    return {
+        "period": f"{date_from.isoformat()} to {today.isoformat()}",
+        "working_days": len(all_weekdays),
+        "total_hours": round(total_hours, 2),
+        "avg_hours_per_day": round(total_hours / max(1, len(all_weekdays)), 2),
+        "unlogged_days": unlogged_days,
+        "unlogged_count": len(unlogged_days),
+        "low_hours_days": low_days,
+        "days": day_summary,
+    }
+
+
 async def _tool_generate_standup(params: dict, user: User, db: Session) -> dict:
     from app.ai.documents import generate_standup
 
@@ -476,6 +575,7 @@ _TOOL_HANDLERS = {
     "update_ticket_status":  _tool_update_ticket_status,
     "search":                _tool_search,
     "rag_query":             _tool_rag_query,
+    "get_timesheet":         _tool_get_timesheet,
     "create_ticket":         _tool_create_ticket,
     "create_wiki_page":      _tool_create_wiki_page,
     "generate_standup":      _tool_generate_standup,
@@ -560,16 +660,30 @@ async def run_agent_loop(
         # force a search so we never return hallucinated ticket data.
         _NEEDS_TOOL_RE = re.compile(
             r"\b(ticket|bug|issue|sprint|blocker|open|closed|done|progress|"
-            r"decision|wiki|standup|assignee|priority|status|blocked)\b",
+            r"decision|wiki|standup|assignee|priority|status|blocked|"
+            r"timesheet|time|hours|logged|log|worklog|days|missing|entry|entries)\b",
+            re.IGNORECASE,
+        )
+        _TIMESHEET_RE = re.compile(
+            r"\b(timesheet|time.?sheet|hours|logged|worklog|days.*(not|miss)|"
+            r"(not|miss).*(log|day)|log.*time|time.*log)\b",
             re.IGNORECASE,
         )
         if tool_call is None and i == 0 and _NEEDS_TOOL_RE.search(user_message):
-            logger.info("Agent returned a direct answer on iteration 0 for a data question — injecting search")
-            tool_call = {
-                "action":     "search",
-                "parameters": {"query": user_message[:200], "scope": "all"},
-                "reasoning":  "auto-injected: user asked a data question but agent skipped tool call",
-            }
+            if _TIMESHEET_RE.search(user_message):
+                logger.info("Agent skipped tool on timesheet question — injecting get_timesheet")
+                tool_call = {
+                    "action":     "get_timesheet",
+                    "parameters": {"days": 14},
+                    "reasoning":  "auto-injected: user asked about timesheet/time logged",
+                }
+            else:
+                logger.info("Agent returned a direct answer on iteration 0 for a data question — injecting search")
+                tool_call = {
+                    "action":     "search",
+                    "parameters": {"query": user_message[:200], "scope": "all"},
+                    "reasoning":  "auto-injected: user asked a data question but agent skipped tool call",
+                }
 
         # ── Final answer ──────────────────────────────────────────────────────
         if tool_call is None:
@@ -585,9 +699,14 @@ async def run_agent_loop(
         params    = tool_call.get("parameters") or {}
         reasoning = str(tool_call.get("reasoning", ""))
 
-        # Deduplication guard: if the exact same call was already made, force final answer
+        # Deduplication guard: if the same tool already succeeded, force final answer immediately
+        already_succeeded = {
+            s["tool_call"]["action"]
+            for s in steps
+            if s.get("tool_call") and s.get("tool_result", {}).get("success")
+        }
         call_fingerprint = f"{action}:{json.dumps(params, sort_keys=True)}"
-        if call_fingerprint in seen_calls:
+        if call_fingerprint in seen_calls or action in already_succeeded:
             logger.warning(f"Agent repeated tool call '{action}' with same params — forcing final answer")
             summary_prompt = (
                 _build_iteration_prompt(user_message, history, steps)

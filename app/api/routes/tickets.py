@@ -33,6 +33,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFi
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.core.database import get_db, SessionLocal
 from app.core.dependencies import get_current_user, get_visibility_scope, VisibilityScope
@@ -180,12 +181,12 @@ def _to_out(t: JiraTicket, db: Session = None) -> dict:
     }
 
 
-async def _embed_ticket_bg(ticket_id: str, title: str, description: str):
+async def _embed_ticket_bg(ticket_id: str, title: str, description: str, issue_type: str = "", pod: str = ""):
     import logging
     try:
         from app.ai.search import embed_and_store_ticket
         db = SessionLocal()
-        await embed_and_store_ticket(ticket_id, title, description, db)
+        await embed_and_store_ticket(ticket_id, title, description, db, issue_type=issue_type, pod=pod)
         db.close()
     except Exception as e:
         logging.getLogger(__name__).warning(f"Auto-embed failed for {ticket_id}: {e}")
@@ -239,7 +240,7 @@ async def nl_create_ticket(
     db.commit()
     db.refresh(ticket)
 
-    background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "")
+    background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "", ticket.issue_type or "", ticket.pod or "")
 
     return {
         "ticket":         _to_out(ticket),
@@ -265,6 +266,25 @@ async def ai_analyze(
     )
 
 
+@router.get("/code-context-status")
+async def code_context_status(user: User = Depends(get_current_user)):
+    """Debug endpoint — shows what repos are discovered and whether code context is configured."""
+    from app.services.github import get_repo_sources, is_configured
+    sources = get_repo_sources()
+    return {
+        "configured": is_configured(),
+        "repos": [
+            {
+                "name":        s.name,
+                "local_path":  str(s.local_path),
+                "path_exists": s.local_path.exists(),
+                "github_repo": s.github_repo,
+            }
+            for s in sources
+        ],
+    }
+
+
 @router.get("/{ticket_key}/code-context")
 async def get_code_context(
     ticket_key: str,
@@ -278,6 +298,47 @@ async def get_code_context(
         return {"connected": False, "files": [], "prs": []}
     result = await search_all_repos(ticket_key=ticket_key, title=title, description=description)
     return {"connected": True, **result}
+
+
+@router.post("/embed-backfill")
+async def embed_backfill(
+    background_tasks: BackgroundTasks,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    """One-shot backfill: re-embed every ticket in the org with enriched content (Type+Pod+Title+Description)."""
+    import logging
+    log = logging.getLogger(__name__)
+
+    missing = db.execute(text("""
+        SELECT t.id, t.summary, t.description, t.issue_type, t.pod
+        FROM jira_tickets t
+        WHERE t.org_id = :org_id
+          AND t.is_deleted = false
+        LIMIT 500
+    """), {"org_id": user.org_id}).fetchall()
+
+    if not missing:
+        return {"status": "ok", "queued": 0, "message": "No tickets found."}
+
+    async def _backfill():
+        from app.ai.search import embed_and_store_ticket
+        success = 0
+        for row in missing:
+            try:
+                bdb = SessionLocal()
+                await embed_and_store_ticket(
+                    str(row.id), row.summary or "", row.description or "",
+                    bdb, issue_type=row.issue_type or "", pod=row.pod or "",
+                )
+                bdb.close()
+                success += 1
+            except Exception as e:
+                log.warning(f"Backfill failed for {row.id}: {e}")
+        log.info(f"Embed backfill complete: {success}/{len(missing)} tickets embedded.")
+
+    background_tasks.add_task(_backfill)
+    return {"status": "ok", "queued": len(missing), "message": f"Backfilling {len(missing)} tickets in the background."}
 
 
 @router.post("", response_model=TicketOut, status_code=201)
@@ -363,7 +424,7 @@ async def create_ticket(
     except Exception as _e:
         _log.error(f"[webhook] dispatch_event failed for ticket_created {ticket.jira_key}: {_e}")
 
-    background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "")
+    background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "", ticket.issue_type or "", ticket.pod or "")
     return TicketOut(**_to_out(ticket, db))
 
 
@@ -746,7 +807,7 @@ async def update_ticket(
 
         db.commit()
         db.refresh(ticket)
-        background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "")
+        background_tasks.add_task(_embed_ticket_bg, ticket.id, ticket.summary, ticket.description or "", ticket.issue_type or "", ticket.pod or "")
 
         if "status" in diff:
             import logging as _logging

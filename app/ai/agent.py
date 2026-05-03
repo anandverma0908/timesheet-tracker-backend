@@ -45,8 +45,9 @@ def _is_conversational(message: str) -> bool:
 
 
 _CONVO_SYSTEM = (
-    "You are NOVA, an AI assistant for Trackly. "
-    "Reply naturally and concisely to the user's message."
+    "You are NOVA/EOS — the intelligent AI operating system of Trackly. "
+    "You are calm, precise, and slightly futuristic — think JARVIS. "
+    "Reply naturally and concisely. Proactively suggest next actions when useful."
 )
 
 
@@ -81,79 +82,63 @@ def _normalize_status(raw: str) -> str:
     return _STATUS_ALIASES.get(raw.strip().lower(), raw.strip())
 
 
-AGENT_SYSTEM_PROMPT = """You are NOVA, an autonomous AI project management agent for Trackly.
-You have access to tools and must use them to answer questions accurately.
+AGENT_SYSTEM_PROMPT = """You are NOVA/EOS — the intelligent AI operating system of the Trackly platform. You are concise, precise, slightly futuristic. Never verbose.
 
-AVAILABLE TOOLS:
+=== HOW TO RESPOND ===
 
-### get_ticket
-Fetch a ticket by its exact key (e.g. TRKLY-1). Use this when the user mentions a specific ticket key.
-Parameters:
-  key (string, required): Exact ticket key, e.g. "TRKLY-1"
+You respond in one of two ways ONLY. Pick one. Never mix them.
 
-### update_ticket_status
-Update the status of a ticket by its key.
-Valid statuses: Backlog, To Do, In Progress, In Review, Done, Blocked.
-Parameters:
-  key (string, required): Ticket key, e.g. "TRKLY-1"
-  status (string, required): New status — must be one of the valid values above
+[1] CALL A TOOL — output exactly this JSON and nothing else:
+{{"action": "tool_name", "parameters": {{"key": "value"}}, "reasoning": "brief why"}}
 
-### search
-Search the project knowledge base for tickets, wiki pages, decisions, and standups.
-Use this when the user does NOT provide a specific ticket key.
-Parameters:
-  query (string, required): Search query text
-  scope (string): 'all' (default), 'tickets', or 'wiki'
+[2] GIVE YOUR ANSWER — output plain text (markdown allowed). No JSON. No labels. Just the answer.
 
-### rag_query
-Ask a natural-language question against the full RAG index with source citations.
-Better than raw search for synthesis or summary questions.
-Parameters:
-  question (string, required): Natural-language question
+Do NOT start your response with any label like "MODE", "Status", "FINAL ANSWER" etc. Just output the JSON or the answer directly.
 
-### create_ticket
-Create a new ticket in the project tracker.
-Only call this when the user explicitly requests ticket creation.
-Parameters:
-  title (string, required): Short action-oriented title
-  description (string, required): Full description with context
-  priority (string): High | Medium | Low  (default Medium)
-  issue_type (string): Bug | Task | Story  (default Task)
+=== STRICT RULES ===
 
-### create_wiki_page
-Create a new wiki page to document decisions, processes, or fill knowledge gaps.
-Only call this when the user explicitly requests wiki page creation.
-Parameters:
-  space_id (string, required): Wiki space ID (find via search if unknown)
-  title (string, required): Page title
-  content (string, required): Full page content in Markdown
-  parent_id (string): Optional parent page ID for nesting
+1. NEVER guess, fabricate, or invent ticket keys, names, or data. If you have not called a tool yet, you do not know the answer.
+2. ALWAYS call a tool first when the user asks about tickets, sprints, blockers, decisions, or wiki — you cannot answer from memory.
+3. Once you have tool results in context, write your answer immediately. Do not call the same tool again.
+4. For greetings or small talk only, reply directly without tools.
 
-### generate_standup
-Auto-generate today's standup for the current user from recent activity.
-Parameters: none
+=== TOOLS ===
 
-RESPONSE FORMAT — follow exactly:
-- To call a tool: respond with ONLY a raw JSON object, no prose, no fences:
-  {"action": "tool_name", "parameters": {"key": "value"}, "reasoning": "brief reason"}
-- To give a final answer: respond with plain text only (no JSON).
-- NEVER mix JSON and prose. One or the other per response.
-- NEVER invent facts — always use tools to retrieve data.
-- After all tool calls are done, give a concise plain-text summary.
-- NEVER call the same tool with the same parameters twice.
-- When the user mentions a ticket key like TRKLY-1, always use get_ticket first, not search.
+search — Search tickets, wiki, decisions, standups across ALL pods/spaces.
+  Parameters: query (string), scope ("all" | "tickets" | "wiki", default "all")
+  Use for: any question about open tickets, blockers, bugs, sprint status, team work
 
-WHEN NOT TO USE TOOLS:
-- Greetings ("hi", "hello", "hey") → reply with plain text immediately, no tool calls.
-- Small talk or conversational messages → reply with plain text immediately.
-- If you have already retrieved enough information → stop calling tools and give your answer.
+get_ticket — Fetch one ticket by exact key.
+  Parameters: key (string)  e.g. "TRKLY-1"
 
-EXAMPLES:
-  User: "hi"         → "Hello! How can I help you with your project today?"
-  User: "thanks"     → "You're welcome! Let me know if there's anything else."
-  User: "what bugs are open?" → call search tool first, then answer from results.
+update_ticket_status — Change a ticket's status.
+  Parameters: key (string), status ("Backlog" | "To Do" | "In Progress" | "In Review" | "Done" | "Blocked")
 
-ITERATION LIMIT: {max_iter} tool calls maximum. Use them wisely."""
+rag_query — Ask a natural-language question against the full knowledge index.
+  Parameters: question (string)
+  Use for: summaries, synthesis, "what did we decide about X"
+
+create_ticket — Create a new ticket. Only when user explicitly asks.
+  Parameters: title (string), description (string), priority (string), issue_type (string)
+
+create_wiki_page — Create a wiki page. Only when explicitly asked.
+  Parameters: space_id (string), title (string), content (string)
+
+generate_standup — Generate today's standup from recent activity.
+  Parameters: (none)
+
+=== EXAMPLES ===
+
+User: "what tickets are open right now?"
+Your response: {{"action": "search", "parameters": {{"query": "open", "scope": "tickets"}}, "reasoning": "search all tickets"}}
+
+User: "what is TRKLY-5?"
+Your response: {{"action": "get_ticket", "parameters": {{"key": "TRKLY-5"}}, "reasoning": "fetch ticket by key"}}
+
+User: "hi"
+Your response: Hey! What would you like to know about your project?
+
+Limit: {max_iter} tool calls maximum."""
 
 
 # ── Prompt builder ────────────────────────────────────────────────────────────
@@ -200,30 +185,51 @@ def _build_iteration_prompt(
 def _parse_tool_call(text: str) -> Optional[dict]:
     """
     Detect a JSON tool call in raw LLM output.
-    Returns the parsed dict if found, None if this is a plain-text final answer.
+    Returns the parsed dict only when the response is predominantly a tool call
+    (JSON is found and there is no substantial prose wrapping it).
+    Returns None for plain-text final answers or mixed responses.
     """
     text = text.strip()
 
-    # 1. Fenced JSON block
+    # 1. Fenced JSON block (```json ... ```)
     m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if m:
         try:
             obj = json.loads(m.group(1).strip())
             if isinstance(obj.get("action"), str) and obj["action"]:
+                # Reject if substantial prose surrounds the block
+                prose = text[:m.start()].strip() + text[m.end():].strip()
+                if len(prose) > 120:
+                    return None
                 return obj
         except json.JSONDecodeError:
             pass
 
-    # 2. Bare JSON object with "action" key
+    # 2. Bare JSON object starting with { containing "action"
     start = text.find("{")
     end   = text.rfind("}")
-    if start != -1 and end > start:
-        try:
-            obj = json.loads(text[start:end + 1])
-            if isinstance(obj.get("action"), str) and obj["action"]:
-                return obj
-        except json.JSONDecodeError:
-            pass
+    if start == -1 or end <= start:
+        return None
+
+    # Only parse if the JSON is the bulk of the response.
+    # Allow up to 80 chars of prose before the JSON (model might emit a short prefix).
+    # But reject if there's a full sentence of prose AND more prose after the JSON.
+    prose_before = text[:start].strip()
+    prose_after  = text[end + 1:].strip()
+
+    if len(prose_before) > 80:
+        return None
+
+    # If there's significant prose after the JSON it's a mixed response — reject
+    if len(prose_after) > 60:
+        return None
+
+    try:
+        obj = json.loads(text[start:end + 1])
+        if isinstance(obj.get("action"), str) and obj["action"]:
+            return obj
+    except json.JSONDecodeError:
+        pass
 
     return None
 
@@ -549,6 +555,22 @@ async def run_agent_loop(
 
         tool_call = _parse_tool_call(last_text)
 
+        # ── Safety net: first iteration returned no tool call for a data question ──
+        # If the LLM skipped tools and tried to answer from memory on iteration 0,
+        # force a search so we never return hallucinated ticket data.
+        _NEEDS_TOOL_RE = re.compile(
+            r"\b(ticket|bug|issue|sprint|blocker|open|closed|done|progress|"
+            r"decision|wiki|standup|assignee|priority|status|blocked)\b",
+            re.IGNORECASE,
+        )
+        if tool_call is None and i == 0 and _NEEDS_TOOL_RE.search(user_message):
+            logger.info("Agent returned a direct answer on iteration 0 for a data question — injecting search")
+            tool_call = {
+                "action":     "search",
+                "parameters": {"query": user_message[:200], "scope": "all"},
+                "reasoning":  "auto-injected: user asked a data question but agent skipped tool call",
+            }
+
         # ── Final answer ──────────────────────────────────────────────────────
         if tool_call is None:
             steps.append({
@@ -567,21 +589,29 @@ async def run_agent_loop(
         call_fingerprint = f"{action}:{json.dumps(params, sort_keys=True)}"
         if call_fingerprint in seen_calls:
             logger.warning(f"Agent repeated tool call '{action}' with same params — forcing final answer")
-            # Ask the LLM to summarise what it found so far
             summary_prompt = (
                 _build_iteration_prompt(user_message, history, steps)
-                + "\n\nYou have already retrieved this information. "
-                  "Now provide your final plain-text answer based on the results above."
+                + "\n\nYou now have all the data you need. "
+                  "Write your FINAL ANSWER as plain text only — no JSON, no tool calls, no Status/Next labels."
             )
-            last_text = await chat(
+            raw_summary = await chat(
                 user_message=summary_prompt,
                 system_prompt=system_prompt,
                 temperature=0.3,
                 max_tokens=600,
             )
+            # Strip any JSON the LLM might still emit despite instructions
+            forced_text = re.sub(r"```[\s\S]*?```", "", raw_summary).strip()
+            forced_text = re.sub(r"\{[^{}]*\"action\"[^{}]*\}", "", forced_text).strip()
+            if not forced_text:
+                forced_text = "Here are the results I found:\n\n" + "\n".join(
+                    f"- {s['tool_result']['data']}" for s in steps
+                    if s.get("tool_result", {}).get("success")
+                )
+            last_text = forced_text
             steps.append({
                 "iteration":  i,
-                "final_text": last_text.strip(),
+                "final_text": last_text,
                 "timestamp":  datetime.utcnow().isoformat(),
             })
             break

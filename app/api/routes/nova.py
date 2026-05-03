@@ -870,13 +870,25 @@ async def knowledge_gaps(
         KnowledgeGap.org_id == user.org_id,
     ).order_by(KnowledgeGap.detected_at.desc()).limit(50).all()
 
+    def _parse_example_tickets(raw) -> list:
+        if not raw:
+            return []
+        raw = raw.strip()
+        if raw.startswith("["):
+            try:
+                return json.loads(raw)
+            except Exception:
+                pass
+        # Fallback: comma-separated string like "TRKLY-1,TRKLY-2"
+        return [t.strip() for t in raw.split(",") if t.strip()]
+
     return [
         {
             "id":              g.id,
             "topic":           g.topic,
             "ticket_count":    g.ticket_count,
             "wiki_coverage":   g.wiki_coverage,
-            "example_tickets": json.loads(g.example_tickets) if g.example_tickets else [],
+            "example_tickets": _parse_example_tickets(g.example_tickets),
             "suggestion":      g.suggestion,
             "detected_at":     g.detected_at.isoformat() if g.detected_at else None,
         }

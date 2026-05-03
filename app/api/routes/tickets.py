@@ -23,11 +23,14 @@ Endpoints:
   GET    /api/tickets/:id/activity       Audit log for ticket
 """
 
+import csv
+import io
 import os
 import uuid
 from typing import Optional, List, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, UploadFile, File, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -39,6 +42,7 @@ from app.models.audit import AuditLog
 from app.models.user import User
 from app.schemas.ticket import (
     TicketCreate, TicketUpdate, TicketOut, StatusTransition,
+    RejectionReason,
     NLCreateRequest, AIAnalyzeRequest, AIAnalyzeOut,
     CommentCreate, CommentOut, AttachmentOut, WorklogOut,
     TicketLinkCreate, TicketLinkOut,
@@ -48,7 +52,7 @@ router = APIRouter(prefix="/api/tickets", tags=["tickets"])
 
 os.makedirs(settings.upload_dir, exist_ok=True)
 
-VALID_STATUSES = ["Backlog", "To Do", "In Progress", "In Review", "Done", "Blocked"]
+VALID_STATUSES = ["Backlog", "To Do", "In Progress", "In Review", "Done", "Blocked", "Pending Approval", "Approved", "Rejected"]
 
 # All transitions are allowed — the drag-and-drop board must be able to move freely.
 ALLOWED_TRANSITIONS: Dict[str, Optional[List[str]]] = {}
@@ -415,6 +419,240 @@ async def list_tickets(
     }
 
 
+# ── EXPORT / IMPORT CSV ───────────────────────────────────────────────────────
+
+@router.get("/export")
+async def export_tickets(
+    pod:        Optional[str] = Query(None),
+    client:     Optional[str] = Query(None),
+    date_from:  Optional[str] = Query(None),
+    date_to:    Optional[str] = Query(None),
+    status:     Optional[str] = Query(None),
+    assignee:   Optional[str] = Query(None),
+    user_filter: Optional[str] = Query(None, alias="user"),
+    issue_type: Optional[str] = Query(None),
+    search:     Optional[str] = Query(None),
+    db:      Session         = Depends(get_db),
+    user:    User            = Depends(get_current_user),
+    scope:   VisibilityScope = Depends(get_visibility_scope),
+):
+    from sqlalchemy import or_
+    import datetime
+
+    effective_assignee = assignee or user_filter
+    q = db.query(JiraTicket).filter(
+        JiraTicket.org_id == user.org_id,
+        JiraTicket.is_deleted == False,
+    )
+
+    if not scope.unrestricted:
+        conditions = []
+        if scope.allowed_pods:
+            conditions.append(JiraTicket.pod.in_(scope.allowed_pods))
+        if scope.allowed_emails:
+            conditions.append(JiraTicket.assignee_email.in_(scope.allowed_emails))
+        if conditions:
+            q = q.filter(or_(*conditions))
+
+    if pod:                q = q.filter(JiraTicket.pod == pod)
+    if status:             q = q.filter(JiraTicket.status == status)
+    if effective_assignee: q = q.filter(JiraTicket.assignee.ilike(f"%{effective_assignee}%"))
+    if client:             q = q.filter(JiraTicket.client == client)
+    if issue_type:         q = q.filter(JiraTicket.issue_type == issue_type)
+    if search:             q = q.filter(JiraTicket.summary.ilike(f"%{search}%"))
+
+    if date_from:
+        try:
+            df = datetime.datetime.strptime(date_from, "%Y-%m-%d")
+            q = q.filter(JiraTicket.synced_at >= df)
+        except ValueError:
+            pass
+    if date_to:
+        try:
+            dt = datetime.datetime.strptime(date_to, "%Y-%m-%d") + datetime.timedelta(days=1)
+            q = q.filter(JiraTicket.synced_at < dt)
+        except ValueError:
+            pass
+
+    tickets = q.order_by(JiraTicket.synced_at.desc()).all()
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "key", "summary", "status", "priority", "assignee", "client",
+        "pod", "issue_type", "story_points", "hours_spent",
+        "original_estimate_hours", "created", "updated",
+    ])
+
+    for t in tickets:
+        created = t.jira_created.isoformat() if t.jira_created else (t.synced_at.isoformat() if t.synced_at else "")
+        updated = t.jira_updated.isoformat() if t.jira_updated else (t.synced_at.isoformat() if t.synced_at else "")
+        writer.writerow([
+            t.jira_key or "",
+            t.summary or "",
+            t.status or "",
+            t.priority or "",
+            t.assignee or "",
+            t.client or "",
+            t.pod or "",
+            t.issue_type or "",
+            t.story_points if t.story_points is not None else "",
+            t.hours_spent or 0,
+            t.original_estimate_hours or 0,
+            created,
+            updated,
+        ])
+
+    output.seek(0)
+    filename = f"tickets_export_{datetime.date.today().isoformat()}.csv"
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+class ImportSummary(BaseModel):
+    created: int
+    updated: int
+    errors: List[str]
+
+
+@router.post("/import", response_model=ImportSummary)
+async def import_tickets(
+    file: UploadFile = File(...),
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    import datetime
+    from app.models.base import gen_uuid
+
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(400, "File must be a CSV")
+
+    contents = await file.read()
+    try:
+        text = contents.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = contents.decode("latin-1")
+
+    reader = csv.DictReader(io.StringIO(text))
+
+    required = {"summary", "status", "priority", "assignee", "client", "pod", "issue_type"}
+    header_set = set(reader.fieldnames or [])
+    missing = required - header_set
+    if missing:
+        raise HTTPException(400, f"Missing required columns: {sorted(missing)}")
+
+    created_count = 0
+    updated_count = 0
+    errors: List[str] = []
+
+    try:
+        for idx, row in enumerate(reader, start=2):
+            key = (row.get("key") or "").strip()
+            summary = (row.get("summary") or "").strip()
+            status = (row.get("status") or "").strip()
+            priority = (row.get("priority") or "").strip()
+            assignee = (row.get("assignee") or "").strip()
+            client = (row.get("client") or "").strip()
+            pod = (row.get("pod") or "").strip()
+            issue_type = (row.get("issue_type") or "").strip()
+
+            if not summary:
+                errors.append(f"Row {idx}: summary is required")
+                continue
+
+            if status and status not in VALID_STATUSES:
+                errors.append(f"Row {idx}: invalid status '{status}'")
+                continue
+            if issue_type and issue_type not in VALID_ISSUE_TYPES:
+                errors.append(f"Row {idx}: invalid issue_type '{issue_type}'")
+                continue
+            if priority and priority not in {"Highest", "High", "Medium", "Low", "Lowest"}:
+                errors.append(f"Row {idx}: invalid priority '{priority}'")
+                continue
+
+            story_points = None
+            if row.get("story_points"):
+                try:
+                    sp = int(float(row["story_points"]))
+                    if sp in {1, 2, 3, 5, 8, 13, 21}:
+                        story_points = sp
+                except ValueError:
+                    pass
+
+            hours_spent = 0.0
+            if row.get("hours_spent"):
+                try:
+                    hours_spent = float(row["hours_spent"])
+                except ValueError:
+                    pass
+
+            original_estimate_hours = 0.0
+            if row.get("original_estimate_hours"):
+                try:
+                    original_estimate_hours = float(row["original_estimate_hours"])
+                except ValueError:
+                    pass
+
+            if key:
+                ticket = db.query(JiraTicket).filter(
+                    JiraTicket.jira_key == key,
+                    JiraTicket.org_id == user.org_id,
+                    JiraTicket.is_deleted == False,
+                ).first()
+                if not ticket:
+                    errors.append(f"Row {idx}: ticket '{key}' not found")
+                    continue
+
+                ticket.summary = summary
+                if status:     ticket.status = status
+                if priority:   ticket.priority = priority
+                if assignee:   ticket.assignee = assignee
+                if client:     ticket.client = client
+                if pod:        ticket.pod = pod
+                if issue_type: ticket.issue_type = issue_type
+                if story_points is not None:
+                    ticket.story_points = story_points
+                ticket.hours_spent = hours_spent
+                ticket.original_estimate_hours = original_estimate_hours
+
+                _write_audit(db, ticket.id, user.org_id, user.id, "csv_updated", {"summary": summary})
+                updated_count += 1
+            else:
+                jira_key = _next_jira_key(db, user.org_id, pod)
+                ticket = JiraTicket(
+                    id=gen_uuid(),
+                    org_id=user.org_id,
+                    jira_key=jira_key,
+                    project_key=jira_key.split("-")[0],
+                    summary=summary,
+                    status=status or "To Do",
+                    priority=priority or "Medium",
+                    assignee=assignee or None,
+                    client=client or None,
+                    pod=pod or None,
+                    issue_type=issue_type or "Task",
+                    story_points=story_points,
+                    hours_spent=hours_spent,
+                    original_estimate_hours=original_estimate_hours,
+                    reporter=user.name,
+                    is_deleted=False,
+                )
+                db.add(ticket)
+                db.flush()  # make visible to subsequent key generation
+                _write_audit(db, ticket.id, user.org_id, user.id, "csv_created", {"summary": summary})
+                created_count += 1
+
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Import failed: {e}")
+
+    return ImportSummary(created=created_count, updated=updated_count, errors=errors)
+
+
 # ── GET / UPDATE / DELETE ─────────────────────────────────────────────────────
 
 @router.get("/{ticket_id}", response_model=TicketOut)
@@ -629,6 +867,163 @@ async def transition_status(
     except Exception as _e:
         _logger_ts.error(f"[transition_status] serialization failed for {ticket_id}: {_e}\n{_tb.format_exc()}")
         raise HTTPException(500, f"Status updated but response serialization failed: {_e}")
+
+
+# ── APPROVAL WORKFLOW ─────────────────────────────────────────────────────────
+
+@router.post("/{ticket_id}/submit-for-approval", response_model=TicketOut)
+async def submit_for_approval(
+    ticket_id: str,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
+    old_status = ticket.status
+    ticket.status = "Pending Approval"
+    _write_audit(db, ticket.id, user.org_id, user.id, "submitted_for_approval", {
+        "old": old_status, "new": "Pending Approval"
+    })
+
+    # Notify managers in the org
+    from app.models.notification import Notification as Notif
+    from app.models.base import gen_uuid as _gen
+    managers = db.query(User).filter(
+        User.org_id == user.org_id,
+        User.role.in_(["admin", "engineering_manager"]),
+    ).all()
+    for mgr in managers:
+        if mgr.id != user.id:
+            db.add(Notif(
+                id=_gen(), org_id=user.org_id, user_id=mgr.id,
+                type="approval_requested",
+                title=f"Approval requested: {ticket.jira_key}",
+                body=ticket.summary[:200],
+                link=f"/tickets?key={ticket.jira_key}",
+            ))
+
+    db.commit()
+    db.refresh(ticket)
+    return TicketOut(**_to_out(ticket, db))
+
+
+@router.post("/{ticket_id}/approve", response_model=TicketOut)
+async def approve_ticket(
+    ticket_id: str,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
+    if ticket.status != "Pending Approval":
+        raise HTTPException(422, "Ticket must be in 'Pending Approval' status to approve")
+
+    old_status = ticket.status
+    ticket.status = "To Do"
+    _write_audit(db, ticket.id, user.org_id, user.id, "approved", {
+        "old": old_status, "new": "To Do", "approver": user.name
+    })
+
+    # Notify reporter/submitter
+    from app.models.notification import Notification as Notif
+    from app.models.base import gen_uuid as _gen
+    if ticket.reporter:
+        submitter = db.query(User).filter(
+            User.org_id == user.org_id,
+            User.name == ticket.reporter,
+        ).first()
+        if submitter and submitter.id != user.id:
+            db.add(Notif(
+                id=_gen(), org_id=user.org_id, user_id=submitter.id,
+                type="ticket_approved",
+                title=f"Approved: {ticket.jira_key}",
+                body=ticket.summary[:200],
+                link=f"/tickets?key={ticket.jira_key}",
+            ))
+
+    db.commit()
+    db.refresh(ticket)
+    return TicketOut(**_to_out(ticket, db))
+
+
+@router.post("/{ticket_id}/reject", response_model=TicketOut)
+async def reject_ticket(
+    ticket_id: str,
+    body: RejectionReason,
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+):
+    ticket = _resolve_ticket(db, user.org_id, ticket_id)
+    if not ticket:
+        raise HTTPException(404, "Ticket not found")
+
+    if ticket.status != "Pending Approval":
+        raise HTTPException(422, "Ticket must be in 'Pending Approval' status to reject")
+
+    if not body.reason or not body.reason.strip():
+        raise HTTPException(400, "Rejection reason is required")
+
+    old_status = ticket.status
+    ticket.status = "Rejected"
+    _write_audit(db, ticket.id, user.org_id, user.id, "rejected", {
+        "old": old_status, "new": "Rejected", "reason": body.reason, "rejector": user.name
+    })
+
+    # Notify reporter/submitter
+    from app.models.notification import Notification as Notif
+    from app.models.base import gen_uuid as _gen
+    if ticket.reporter:
+        submitter = db.query(User).filter(
+            User.org_id == user.org_id,
+            User.name == ticket.reporter,
+        ).first()
+        if submitter and submitter.id != user.id:
+            db.add(Notif(
+                id=_gen(), org_id=user.org_id, user_id=submitter.id,
+                type="ticket_rejected",
+                title=f"Rejected: {ticket.jira_key}",
+                body=f"{ticket.summary[:200]} — Reason: {body.reason[:200]}",
+                link=f"/tickets?key={ticket.jira_key}",
+            ))
+
+    db.commit()
+    db.refresh(ticket)
+    return TicketOut(**_to_out(ticket, db))
+
+
+@router.get("/pending-approval", response_model=dict)
+async def list_pending_approval(
+    db:   Session = Depends(get_db),
+    user: User    = Depends(get_current_user),
+    scope: VisibilityScope = Depends(get_visibility_scope),
+):
+    from sqlalchemy import or_
+
+    q = db.query(JiraTicket).filter(
+        JiraTicket.org_id == user.org_id,
+        JiraTicket.is_deleted == False,
+        JiraTicket.status == "Pending Approval",
+    )
+
+    if not scope.unrestricted:
+        conditions = []
+        if scope.allowed_pods:
+            conditions.append(JiraTicket.pod.in_(scope.allowed_pods))
+        if scope.allowed_emails:
+            conditions.append(JiraTicket.assignee_email.in_(scope.allowed_emails))
+        if conditions:
+            q = q.filter(or_(*conditions))
+
+    total   = q.count()
+    tickets = q.order_by(JiraTicket.synced_at.desc()).all()
+    return {
+        "tickets": [_to_out(t) for t in tickets],
+        "total":   total,
+    }
 
 
 # ── COMMENTS ─────────────────────────────────────────────────────────────────

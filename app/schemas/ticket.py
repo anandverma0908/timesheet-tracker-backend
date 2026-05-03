@@ -161,6 +161,10 @@ class StatusTransition(BaseModel):
     status: str
 
 
+class RejectionReason(BaseModel):
+    reason: str
+
+
 class NLCreateRequest(BaseModel):
     text: str
     pod:  Optional[str] = None

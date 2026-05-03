@@ -29,6 +29,10 @@ from app.api.routes.manual_entries import router as manual_entries_router
 from app.api.routes.decisions      import router as decisions_router
 from app.api.routes.processes      import router as processes_router
 from app.api.routes.integrations   import router as integrations_router
+from app.api.routes.audit          import router as audit_router
+from app.api.routes.chat           import router as chat_router
+from app.api.routes.forms          import router as forms_router
+from app.api.routes.guest          import router as guest_router
 
 api_router = APIRouter()
 
@@ -55,3 +59,7 @@ api_router.include_router(manual_entries_router)
 api_router.include_router(decisions_router)
 api_router.include_router(processes_router)
 api_router.include_router(integrations_router)
+api_router.include_router(audit_router)
+api_router.include_router(chat_router)
+api_router.include_router(forms_router)
+api_router.include_router(guest_router)

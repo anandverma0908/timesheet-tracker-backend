@@ -262,6 +262,103 @@ async def velocity_trend(
     ]
 
 
+@router.get("/velocity-anomalies")
+async def velocity_anomalies(
+    db:   Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """
+    Velocity anomaly detection — last 12 completed sprints.
+    Calculates rolling average (last 6 sprints), Z-score, and flags anomalies.
+    """
+    from app.models.sprint import Sprint
+    import math
+
+    sprints = db.query(Sprint).filter(
+        Sprint.org_id  == user.org_id,
+        Sprint.status  == "completed",
+        Sprint.velocity != None,
+    ).order_by(Sprint.end_date.asc()).limit(12).all()
+
+    if not sprints:
+        return {
+            "sprints": [],
+            "summary": {
+                "total_sprints": 0,
+                "anomaly_count": 0,
+                "avg_velocity": 0.0,
+                "trend_direction": "stable",
+            },
+        }
+
+    velocities = [s.velocity or 0 for s in sprints]
+    total = len(sprints)
+    avg_velocity = round(sum(velocities) / total, 2)
+
+    # Trend: compare avg of first 3 vs last 3 sprints
+    first_half = velocities[:3]
+    last_half = velocities[-3:]
+    first_avg = sum(first_half) / max(1, len(first_half))
+    last_avg = sum(last_half) / max(1, len(last_half))
+    if last_avg > first_avg * 1.05:
+        trend_direction = "improving"
+    elif last_avg < first_avg * 0.95:
+        trend_direction = "declining"
+    else:
+        trend_direction = "stable"
+
+    result_sprints = []
+    anomaly_count = 0
+
+    for i, s in enumerate(sprints):
+        v = s.velocity or 0
+        # Rolling window: up to last 6 sprints ending at i
+        start = max(0, i - 5)
+        window = velocities[start : i + 1]
+        rolling_avg = sum(window) / len(window)
+
+        # Sample standard deviation
+        if len(window) > 1:
+            mean = rolling_avg
+            variance = sum((x - mean) ** 2 for x in window) / (len(window) - 1)
+            rolling_std = math.sqrt(variance)
+        else:
+            rolling_std = 0.0
+
+        z_score = round((v - rolling_avg) / rolling_std, 2) if rolling_std > 0 else 0.0
+        is_anomaly = abs(z_score) > 1.5
+
+        if z_score > 1.5:
+            direction = "spike"
+        elif z_score < -1.5:
+            direction = "drop"
+        else:
+            direction = "normal"
+
+        if is_anomaly:
+            anomaly_count += 1
+
+        result_sprints.append({
+            "sprint_id":    str(s.id),
+            "name":         s.name,
+            "velocity":     v,
+            "rolling_avg":  round(rolling_avg, 2),
+            "z_score":      z_score,
+            "is_anomaly":   is_anomaly,
+            "direction":    direction,
+        })
+
+    return {
+        "sprints": result_sprints,
+        "summary": {
+            "total_sprints": total,
+            "anomaly_count": anomaly_count,
+            "avg_velocity": avg_velocity,
+            "trend_direction": trend_direction,
+        },
+    }
+
+
 @router.get("/bug-cost")
 async def bug_cost(
     db:   Session = Depends(get_db),

@@ -8,13 +8,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.security import decode_access_token
 from app.models.user import User
+from app.models.guest import GuestAccessToken
 
 _bearer = HTTPBearer()
 
@@ -116,3 +117,21 @@ def get_visibility_scope(
         unrestricted=False,
         allowed_emails={user.email},
     )
+
+
+# ── Guest dependency ──────────────────────────────────────────────────────────
+
+def get_current_guest(
+    x_guest_token: str = Header(..., alias="X-Guest-Token"),
+    db: Session = Depends(get_db),
+) -> GuestAccessToken:
+    from datetime import datetime
+    guest = db.query(GuestAccessToken).filter(
+        GuestAccessToken.token == x_guest_token,
+        GuestAccessToken.is_active == True,
+    ).first()
+    if not guest:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid guest token")
+    if guest.expires_at and datetime.utcnow() > guest.expires_at:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Guest token expired")
+    return guest

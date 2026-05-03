@@ -81,3 +81,18 @@ class MeetingNotesRequest(BaseModel):
 class MeetingNotesOut(BaseModel):
     action_items: List[dict]
     structured_md: Optional[str] = None
+
+
+class AwarenessUpdate(BaseModel):
+    user_id: str
+    name: str
+    color: str
+    cursor: Optional[dict] = None
+
+
+class AwarenessUserOut(BaseModel):
+    user_id: str
+    name: str
+    color: str
+    cursor: Optional[dict] = None
+    timestamp: float

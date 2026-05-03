@@ -19,8 +19,9 @@ Endpoints:
 
 import json
 import re
+import time
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy import text
@@ -35,9 +36,15 @@ from app.schemas.wiki import (
     WikiSpaceCreate, WikiSpaceUpdate, WikiSpaceOut,
     WikiPageCreate, WikiPageUpdate, WikiPageOut,
     WikiVersionOut, MeetingNotesRequest, MeetingNotesOut,
+    AwarenessUpdate,
 )
 
 router = APIRouter(prefix="/api/wiki", tags=["wiki"])
+
+
+# ── Live Co-editing awareness (in-memory) ─────────────────────────────────────
+
+_awareness_store: Dict[str, list[dict]] = {}
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -487,6 +494,72 @@ async def related_pages(
         raise HTTPException(404, "Page not found")
 
     return _related_pages_for(db, page_id, user.org_id, limit=5)
+
+
+# ── AWARENESS (Live Co-editing) ──────────────────────────────────────────────
+
+@router.post("/pages/{page_id}/awareness")
+async def post_awareness(
+    page_id: str,
+    body: AwarenessUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    page = db.query(WikiPage).filter(
+        WikiPage.id == page_id, WikiPage.org_id == user.org_id
+    ).first()
+    if not page:
+        raise HTTPException(404, "Page not found")
+
+    entry = {
+        "user_id": body.user_id,
+        "name": body.name,
+        "color": body.color,
+        "cursor": body.cursor,
+        "timestamp": time.time(),
+    }
+
+    if page_id not in _awareness_store:
+        _awareness_store[page_id] = []
+
+    # Update existing entry for this user or append
+    existing_idx = next(
+        (i for i, e in enumerate(_awareness_store[page_id]) if e["user_id"] == body.user_id),
+        None,
+    )
+    if existing_idx is not None:
+        _awareness_store[page_id][existing_idx] = entry
+    else:
+        _awareness_store[page_id].append(entry)
+
+    # Prune stale entries (>30s) and keep last 10
+    now = time.time()
+    _awareness_store[page_id] = [
+        e for e in _awareness_store[page_id] if now - e["timestamp"] <= 30
+    ][-10:]
+
+    return {"ok": True}
+
+
+@router.get("/pages/{page_id}/awareness", response_model=List[dict])
+async def get_awareness(
+    page_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    page = db.query(WikiPage).filter(
+        WikiPage.id == page_id, WikiPage.org_id == user.org_id
+    ).first()
+    if not page:
+        raise HTTPException(404, "Page not found")
+
+    now = time.time()
+    entries = _awareness_store.get(page_id, [])
+    active = [
+        e for e in entries
+        if now - e["timestamp"] <= 30 and e["user_id"] != str(user.id)
+    ][-10:]
+    return active
 
 
 # ── WIKI INTELLIGENCE ────────────────────────────────────────────────────────

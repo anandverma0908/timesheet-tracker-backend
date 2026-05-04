@@ -3,6 +3,9 @@ app/api/routes/nova.py — NOVA AI endpoints.
 
 Endpoints:
   GET  /api/nova/status                  Check provider (Ollama/Cerebras) status
+  POST /api/nova/voice-sample            Upload voice reference WAV for cloning
+  GET  /api/nova/voice-sample/status     Check if a voice reference exists
+  POST /api/nova/tts                     Synthesise text → audio using cloned voice
   GET  /api/nova/my-work                 AI-powered My Work page (3 parallel NOVA calls)
   GET  /api/nova/my-brief                AI morning brief for the current user
   POST /api/nova/query                   NL query RAG — used by search modal
@@ -19,11 +22,15 @@ Endpoints:
 """
 
 import hashlib
+import logging
+import os
 from datetime import date
 from typing import Optional
 
+logger = logging.getLogger(__name__)
+
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -2043,3 +2050,101 @@ async def transcribe_media(
         raise HTTPException(503, str(e))
     except Exception as e:
         raise HTTPException(500, f"Transcription failed: {e}")
+
+
+# ── Voice Cloning / TTS ────────────────────────────────────────────────────
+
+
+class TTSRequest(BaseModel):
+    text: str
+    language: str = "en"
+
+
+@router.post("/voice-sample")
+async def upload_voice_sample(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    """Store a WAV voice reference for the current user used by XTTS-v2 cloning."""
+    import shutil, tempfile
+    from pydub import AudioSegment  # type: ignore
+    from app.services.tts import voice_ref_path
+
+    allowed = {"audio/wav", "audio/x-wav", "audio/wave", "audio/mp4",
+               "audio/x-m4a", "audio/mpeg", "audio/ogg", "audio/webm"}
+    ct = (file.content_type or "").lower()
+    if ct not in allowed and not file.filename.lower().endswith(
+        (".wav", ".mp3", ".m4a", ".ogg", ".webm")
+    ):
+        raise HTTPException(400, "Unsupported audio format. Upload a WAV, MP3, M4A, or WebM file.")
+
+    raw = await file.read()
+    if len(raw) < 10_000:
+        raise HTTPException(400, "File too short. Please upload at least 3 seconds of clear speech.")
+
+    # Convert to 22050 Hz mono WAV (XTTS requirement)
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".tmp", delete=False) as tmp:
+            tmp.write(raw)
+            tmp_path = tmp.name
+        audio = AudioSegment.from_file(tmp_path)
+        audio = audio.set_channels(1).set_frame_rate(22050)
+        ref = voice_ref_path(settings.upload_dir, str(user.id))
+        audio.export(str(ref), format="wav")
+        os.unlink(tmp_path)
+    except Exception as e:
+        raise HTTPException(422, f"Could not process audio: {e}")
+
+    duration_s = len(audio) / 1000
+    return {"ok": True, "duration_seconds": round(duration_s, 1), "path": ref.name}
+
+
+@router.get("/voice-sample/status")
+async def voice_sample_status(user: User = Depends(get_current_user)):
+    """Check whether this user has a voice reference saved."""
+    from app.services.tts import has_voice_ref
+    user_ref = has_voice_ref(settings.upload_dir, str(user.id))
+    global_ref = has_voice_ref(settings.upload_dir, None)
+    return {"has_voice": user_ref or global_ref, "user_voice": user_ref}
+
+
+@router.post("/tts")
+async def text_to_speech(
+    body: TTSRequest,
+    user: User = Depends(get_current_user),
+):
+    """Synthesise text using XTTS-v2 and the user's cloned voice. Returns audio/wav."""
+    from app.services.tts import synthesise, has_voice_ref
+
+    if not has_voice_ref(settings.upload_dir, str(user.id)) and \
+       not has_voice_ref(settings.upload_dir, None):
+        raise HTTPException(
+            424,
+            "No voice reference found. Please upload a voice sample in Nova settings first.",
+        )
+
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(400, "Text cannot be empty.")
+    if len(text) > 500:
+        text = text[:500]
+
+    try:
+        audio_bytes = await synthesise(
+            text=text,
+            upload_dir=settings.upload_dir,
+            user_id=str(user.id),
+            language=body.language,
+        )
+    except FileNotFoundError as e:
+        raise HTTPException(424, str(e))
+    except Exception as e:
+        logger.error("TTS synthesis failed: %s", e)
+        raise HTTPException(500, f"Voice synthesis failed: {e}")
+
+    import io
+    return StreamingResponse(
+        io.BytesIO(audio_bytes),
+        media_type="audio/wav",
+        headers={"Cache-Control": "no-store"},
+    )

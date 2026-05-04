@@ -35,3 +35,7 @@ sentence-transformers==3.0.1
 torch==2.4.0
 scikit-learn==1.5.1
 numpy==1.26.4
+
+# ── Voice Cloning (XTTS-v2) ───────────────────────────────────────────────────
+TTS>=0.22.0
+pydub>=0.25.1

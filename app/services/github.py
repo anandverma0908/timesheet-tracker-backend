@@ -714,6 +714,9 @@ async def _rank_prs(
                 "reason": ", ".join(reasons) or "related pull request match",
                 "confidence": _confidence_from_rank(score, 0),
                 "touched_files": touched_files,
+                "merged_at": details.get("merged_at"),
+                "updated_at": details.get("updated_at"),
+                "author": details.get("user", {}).get("login"),
                 "_score": score,
             }
         )

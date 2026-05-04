@@ -123,6 +123,11 @@ get_timesheet — Fetch the current user's timesheet (worklogs + manual entries)
   Use for: ANY question about time logged, hours, timesheet, missing days, daily hours
   Returns: per-day breakdown, total hours, list of days with no time logged
 
+log_time — Log hours for the current user on a specific date.
+  Parameters: date (YYYY-MM-DD, default today), hours (float), activity (string description)
+  Use for: "log X hours for Y", "add 3 hours to my timesheet", "log time for today"
+  Returns: confirmation with entry details
+
 create_ticket — Create a new ticket. Only when user explicitly asks.
   Parameters: title (string), description (string), priority (string), issue_type (string)
 
@@ -556,6 +561,45 @@ async def _tool_get_timesheet(params: dict, user: User, db: Session) -> dict:
     }
 
 
+async def _tool_log_time(params: dict, user: User, db: Session) -> dict:
+    """Log time for the user. params: date (YYYY-MM-DD), hours (float), activity (str)."""
+    from app.models.manual_entry import ManualEntry
+
+    entry_date_str = params.get("date") or date.today().isoformat()
+    try:
+        entry_date = date.fromisoformat(entry_date_str)
+    except ValueError:
+        entry_date = date.today()
+
+    hours = float(params.get("hours", 0))
+    activity = str(params.get("activity", "Work")).strip()
+
+    if hours <= 0:
+        return {"success": False, "error": "hours must be greater than 0"}
+    if hours > 24:
+        return {"success": False, "error": "hours cannot exceed 24"}
+
+    entry = ManualEntry(
+        user_id=user.id,
+        org_id=user.org_id,
+        entry_date=entry_date,
+        hours=hours,
+        activity=activity,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    return {
+        "success": True,
+        "message": f"Logged {hours}h for '{activity}' on {entry_date.isoformat()}",
+        "entry_id": str(entry.id),
+        "date": entry_date.isoformat(),
+        "hours": hours,
+        "activity": activity,
+    }
+
+
 async def _tool_generate_standup(params: dict, user: User, db: Session) -> dict:
     from app.ai.documents import generate_standup
 
@@ -568,17 +612,471 @@ async def _tool_generate_standup(params: dict, user: User, db: Session) -> dict:
     return {"standup": result, "status": "generated"}
 
 
-# ── Tool registry ─���───────────────────────────────────────────────────────────
+async def _tool_get_my_standup(params: dict, user: User, db: Session) -> dict:
+    from app.models.sprint import Standup
+    from app.models.user import User as UserModel
+
+    standup_date = params.get("date", date.today().isoformat())
+    try:
+        d = date.fromisoformat(standup_date)
+    except Exception:
+        d = date.today()
+
+    standup = db.query(Standup).filter(
+        Standup.user_id == str(user.id),
+        Standup.org_id  == user.org_id,
+        Standup.date    == d,
+    ).first()
+
+    if not standup:
+        return {"found": False, "date": d.isoformat(), "message": "No standup found for this date."}
+
+    return {
+        "found":     True,
+        "date":      standup.date.isoformat() if standup.date else d.isoformat(),
+        "yesterday": standup.yesterday or "",
+        "today":     standup.today or "",
+        "blockers":  standup.blockers or "",
+        "shared":    standup.is_shared,
+    }
+
+
+async def _tool_get_team_standup(params: dict, user: User, db: Session) -> dict:
+    from app.models.sprint import Standup
+    from app.models.user import User as UserModel
+
+    standup_date = params.get("date", date.today().isoformat())
+    try:
+        d = date.fromisoformat(standup_date)
+    except Exception:
+        d = date.today()
+
+    standups = db.query(Standup).filter(
+        Standup.org_id == user.org_id,
+        Standup.date   == d,
+    ).all()
+
+    if not standups:
+        return {"found": False, "date": d.isoformat(), "count": 0, "standups": []}
+
+    result = []
+    for s in standups:
+        member = db.query(UserModel).filter(UserModel.id == s.user_id).first()
+        result.append({
+            "engineer": member.name if member else s.user_id,
+            "pod":      member.pod  if member else None,
+            "yesterday": s.yesterday or "",
+            "today":     s.today or "",
+            "blockers":  s.blockers or "",
+        })
+
+    return {"found": True, "date": d.isoformat(), "count": len(result), "standups": result}
+
+
+async def _tool_list_tickets(params: dict, user: User, db: Session) -> dict:
+    from app.models.ticket import JiraTicket
+
+    q = db.query(JiraTicket).filter(
+        JiraTicket.org_id      == user.org_id,
+        JiraTicket.is_deleted  == False,
+    )
+
+    assignee   = params.get("assignee")
+    status     = params.get("status")
+    priority   = params.get("priority")
+    pod        = params.get("pod")
+    issue_type = params.get("issue_type")
+    sprint_id  = params.get("sprint_id")
+    me         = params.get("me", False)
+
+    if me or assignee == "me":
+        q = q.filter(JiraTicket.assignee_email == user.email)
+    elif assignee:
+        q = q.filter(JiraTicket.assignee.ilike(f"%{assignee}%"))
+
+    if status:
+        q = q.filter(JiraTicket.status == status)
+    if priority:
+        q = q.filter(JiraTicket.priority == priority)
+    if pod:
+        q = q.filter(JiraTicket.pod == pod)
+    if issue_type:
+        q = q.filter(JiraTicket.issue_type == issue_type)
+    if sprint_id:
+        q = q.filter(JiraTicket.sprint_id == sprint_id)
+
+    tickets = q.order_by(
+        JiraTicket.status.asc(),
+        JiraTicket.priority.asc(),
+    ).limit(20).all()
+
+    return {
+        "count": len(tickets),
+        "tickets": [
+            {
+                "key":         t.jira_key,
+                "title":       t.summary,
+                "status":      t.status,
+                "priority":    t.priority,
+                "issue_type":  t.issue_type,
+                "assignee":    t.assignee,
+                "pod":         t.pod,
+                "story_points": t.story_points,
+                "sprint_id":   str(t.sprint_id) if t.sprint_id else None,
+            }
+            for t in tickets
+        ],
+    }
+
+
+async def _tool_get_sprint(params: dict, user: User, db: Session) -> dict:
+    from app.models.sprint import Sprint as SprintModel
+    from app.models.ticket import JiraTicket
+
+    sprint_id = params.get("sprint_id")
+    pod       = params.get("pod")
+    status    = params.get("status", "active")
+
+    if sprint_id:
+        sprint = db.query(SprintModel).filter(
+            SprintModel.id     == sprint_id,
+            SprintModel.org_id == user.org_id,
+        ).first()
+        sprints = [sprint] if sprint else []
+    else:
+        q = db.query(SprintModel).filter(SprintModel.org_id == user.org_id)
+        if status:
+            q = q.filter(SprintModel.status == status)
+        if pod:
+            q = q.filter(SprintModel.pod == pod)
+        sprints = q.order_by(SprintModel.start_date.desc()).limit(5).all()
+
+    results = []
+    for s in sprints:
+        tickets = db.query(JiraTicket).filter(
+            JiraTicket.sprint_id  == s.id,
+            JiraTicket.is_deleted == False,
+        ).all()
+
+        done  = [t for t in tickets if t.status == "Done"]
+        blocked = [t for t in tickets if t.status == "Blocked"]
+        total_pts = sum(t.story_points or 0 for t in tickets)
+        done_pts  = sum(t.story_points or 0 for t in done)
+
+        results.append({
+            "id":           str(s.id),
+            "name":         s.name,
+            "pod":          s.pod,
+            "status":       s.status,
+            "start_date":   s.start_date.isoformat() if s.start_date else None,
+            "end_date":     s.end_date.isoformat()   if s.end_date   else None,
+            "total_tickets": len(tickets),
+            "done_tickets":  len(done),
+            "blocked_tickets": len(blocked),
+            "total_points":  total_pts,
+            "done_points":   done_pts,
+            "completion_pct": round(done_pts / total_pts * 100, 1) if total_pts else 0,
+            "tickets": [
+                {"key": t.jira_key, "title": t.summary, "status": t.status,
+                 "assignee": t.assignee, "story_points": t.story_points}
+                for t in tickets[:15]
+            ],
+        })
+
+    return {"sprints": results, "count": len(results)}
+
+
+async def _tool_get_team(params: dict, user: User, db: Session) -> dict:
+    from app.models.user import User as UserModel
+    from app.models.ticket import JiraTicket
+
+    pod  = params.get("pod")
+    role = params.get("role")
+
+    q = db.query(UserModel).filter(
+        UserModel.org_id  == user.org_id,
+        UserModel.status  == "active",
+    )
+    if pod:
+        q = q.filter(UserModel.pod.ilike(f"%{pod}%"))
+    if role:
+        q = q.filter(UserModel.role == role)
+
+    members = q.all()
+
+    result = []
+    for m in members:
+        open_tickets = db.query(JiraTicket).filter(
+            JiraTicket.org_id         == user.org_id,
+            JiraTicket.assignee_email == m.email,
+            JiraTicket.status.notin_(["Done", "Cancelled"]),
+            JiraTicket.is_deleted     == False,
+        ).count()
+        result.append({
+            "name":         m.name,
+            "email":        m.email,
+            "role":         m.role,
+            "pod":          m.pod,
+            "reporting_to": m.reporting_to,
+            "open_tickets": open_tickets,
+        })
+
+    return {"count": len(result), "team": result}
+
+
+async def _tool_get_decisions(params: dict, user: User, db: Session) -> dict:
+    from app.models.knowledge import Decision
+
+    q = db.query(Decision).filter(
+        Decision.org_id     == user.org_id,
+        Decision.is_deleted == False,
+    )
+
+    status   = params.get("status")
+    space_id = params.get("pod") or params.get("space_id")
+    keyword  = params.get("query")
+
+    if status:
+        q = q.filter(Decision.status == status)
+    if space_id:
+        q = q.filter(Decision.space_id == space_id)
+    if keyword:
+        kw = f"%{keyword.lower()}%"
+        q = q.filter(
+            (Decision.title.ilike(kw)) |
+            (Decision.decision.ilike(kw)) |
+            (Decision.context.ilike(kw))
+        )
+
+    decisions = q.order_by(Decision.created_at.desc()).limit(10).all()
+
+    return {
+        "count": len(decisions),
+        "decisions": [
+            {
+                "id":       d.id,
+                "number":   d.number,
+                "title":    d.title,
+                "status":   d.status,
+                "owner":    d.owner,
+                "date":     d.date,
+                "decision": (d.decision or "")[:300],
+                "tags":     d.tags or [],
+            }
+            for d in decisions
+        ],
+    }
+
+
+async def _tool_get_goals(params: dict, user: User, db: Session) -> dict:
+    from app.models.goal import Goal
+
+    q = db.query(Goal).filter(Goal.org_id == user.org_id)
+
+    quarter = params.get("quarter")
+    status  = params.get("status")
+    owner   = params.get("owner")
+
+    if quarter:
+        q = q.filter(Goal.quarter.ilike(f"%{quarter}%"))
+    if status:
+        q = q.filter(Goal.status == status)
+    if owner:
+        q = q.filter(Goal.owner.ilike(f"%{owner}%"))
+
+    goals = q.order_by(Goal.created_at.desc()).limit(10).all()
+
+    return {
+        "count": len(goals),
+        "goals": [
+            {
+                "id":       str(g.id),
+                "title":    g.title,
+                "quarter":  g.quarter,
+                "status":   g.status,
+                "owner":    g.owner,
+                "progress": g.overall_progress,
+                "key_results": g.key_results or [],
+            }
+            for g in goals
+        ],
+    }
+
+
+async def _tool_get_analytics(params: dict, user: User, db: Session) -> dict:
+    from app.models.ticket import JiraTicket
+    from app.models.sprint import Sprint as SprintModel
+    from sqlalchemy import func
+
+    pod = params.get("pod")
+    metric = params.get("metric", "overview")
+
+    base_q = db.query(JiraTicket).filter(
+        JiraTicket.org_id     == user.org_id,
+        JiraTicket.is_deleted == False,
+    )
+    if pod:
+        base_q = base_q.filter(JiraTicket.pod == pod)
+
+    total   = base_q.count()
+    done    = base_q.filter(JiraTicket.status == "Done").count()
+    blocked = base_q.filter(JiraTicket.status == "Blocked").count()
+    in_prog = base_q.filter(JiraTicket.status == "In Progress").count()
+    bugs    = base_q.filter(JiraTicket.issue_type == "Bug").count()
+    open_bugs = base_q.filter(
+        JiraTicket.issue_type == "Bug",
+        JiraTicket.status != "Done",
+    ).count()
+    high_pri = base_q.filter(
+        JiraTicket.priority.in_(["High", "Highest"]),
+        JiraTicket.status != "Done",
+    ).count()
+
+    # Active sprint summary
+    active_sprint = db.query(SprintModel).filter(
+        SprintModel.org_id  == user.org_id,
+        SprintModel.status  == "active",
+        *([ SprintModel.pod == pod ] if pod else []),
+    ).first()
+
+    sprint_summary = None
+    if active_sprint:
+        sp_tickets = db.query(JiraTicket).filter(
+            JiraTicket.sprint_id  == active_sprint.id,
+            JiraTicket.is_deleted == False,
+        ).all()
+        sp_done = [t for t in sp_tickets if t.status == "Done"]
+        sp_pts  = sum(t.story_points or 0 for t in sp_tickets)
+        sp_done_pts = sum(t.story_points or 0 for t in sp_done)
+        sprint_summary = {
+            "name":          active_sprint.name,
+            "end_date":      active_sprint.end_date.isoformat() if active_sprint.end_date else None,
+            "total_tickets": len(sp_tickets),
+            "done_tickets":  len(sp_done),
+            "total_points":  sp_pts,
+            "done_points":   sp_done_pts,
+            "completion_pct": round(sp_done_pts / sp_pts * 100, 1) if sp_pts else 0,
+        }
+
+    # By-assignee breakdown
+    assignee_rows = db.query(
+        JiraTicket.assignee, func.count(JiraTicket.id)
+    ).filter(
+        JiraTicket.org_id     == user.org_id,
+        JiraTicket.is_deleted == False,
+        JiraTicket.status.notin_(["Done", "Cancelled"]),
+        JiraTicket.assignee   != None,
+        *([ JiraTicket.pod == pod ] if pod else []),
+    ).group_by(JiraTicket.assignee).order_by(func.count(JiraTicket.id).desc()).limit(10).all()
+
+    return {
+        "scope":          pod or "all pods",
+        "total_tickets":  total,
+        "done":           done,
+        "in_progress":    in_prog,
+        "blocked":        blocked,
+        "completion_rate": round(done / total * 100, 1) if total else 0,
+        "total_bugs":     bugs,
+        "open_bugs":      open_bugs,
+        "high_priority_open": high_pri,
+        "active_sprint":  sprint_summary,
+        "workload_by_assignee": [
+            {"assignee": row[0], "open_tickets": row[1]}
+            for row in assignee_rows
+        ],
+    }
+
+
+async def _tool_get_knowledge_gaps(params: dict, user: User, db: Session) -> dict:
+    from app.models.sprint import KnowledgeGap
+
+    gaps = db.query(KnowledgeGap).filter(
+        KnowledgeGap.org_id == user.org_id,
+    ).order_by(KnowledgeGap.ticket_count.desc()).limit(10).all()
+
+    return {
+        "count": len(gaps),
+        "gaps": [
+            {
+                "topic":        g.topic,
+                "ticket_count": g.ticket_count,
+                "wiki_coverage": g.wiki_coverage,
+                "suggestion":   g.suggestion,
+            }
+            for g in gaps
+        ],
+    }
+
+
+async def _tool_get_wiki(params: dict, user: User, db: Session) -> dict:
+    from app.models.wiki import WikiPage
+
+    q = db.query(WikiPage).filter(
+        WikiPage.org_id     == user.org_id,
+        WikiPage.is_deleted == False,
+    )
+
+    keyword  = params.get("query")
+    space_id = params.get("space_id") or params.get("pod")
+
+    if keyword:
+        kw = f"%{keyword.lower()}%"
+        q = q.filter(
+            (WikiPage.title.ilike(kw)) | (WikiPage.content_md.ilike(kw))
+        )
+    if space_id:
+        q = q.filter(WikiPage.space_id == space_id)
+
+    pages = q.order_by(WikiPage.updated_at.desc()).limit(8).all()
+
+    return {
+        "count": len(pages),
+        "pages": [
+            {
+                "id":      str(p.id),
+                "title":   p.title,
+                "snippet": (p.content_md or "")[:300],
+                "author":  p.author_name,
+                "updated": p.updated_at.isoformat() if p.updated_at else None,
+            }
+            for p in pages
+        ],
+    }
+
+
+# ── Tool registry ─────────────────────────────────────────────────────────────
 
 _TOOL_HANDLERS = {
+    # Tickets
     "get_ticket":            _tool_get_ticket,
+    "list_tickets":          _tool_list_tickets,
     "update_ticket_status":  _tool_update_ticket_status,
+    "create_ticket":         _tool_create_ticket,
+    # Search & RAG
     "search":                _tool_search,
     "rag_query":             _tool_rag_query,
+    # Timesheet
     "get_timesheet":         _tool_get_timesheet,
-    "create_ticket":         _tool_create_ticket,
-    "create_wiki_page":      _tool_create_wiki_page,
+    "log_time":              _tool_log_time,
+    # Standup
+    "get_my_standup":        _tool_get_my_standup,
+    "get_team_standup":      _tool_get_team_standup,
     "generate_standup":      _tool_generate_standup,
+    # Sprint
+    "get_sprint":            _tool_get_sprint,
+    # Analytics
+    "get_analytics":         _tool_get_analytics,
+    # Team / Users
+    "get_team":              _tool_get_team,
+    # Decisions
+    "get_decisions":         _tool_get_decisions,
+    # Goals
+    "get_goals":             _tool_get_goals,
+    # Knowledge Gaps
+    "get_knowledge_gaps":    _tool_get_knowledge_gaps,
+    # Wiki
+    "get_wiki":              _tool_get_wiki,
+    "create_wiki_page":      _tool_create_wiki_page,
 }
 
 

@@ -4,6 +4,7 @@ Supports two inference providers, switchable via NOVA_PROVIDER env var:
   - "ollama"    local Ollama (default)
   - "cerebras"  Cerebras cloud (~2000 tok/s, free tier)
 """
+import asyncio
 import httpx
 import logging
 from typing import Optional
@@ -82,22 +83,43 @@ async def _chat_cerebras(
     temperature: float,
     max_tokens: int,
 ) -> str:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        resp = await client.post(
-            "https://api.cerebras.ai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings.cerebras_api_key}",
-                "Content-Type":  "application/json",
-            },
-            json={
-                "model":       settings.cerebras_model,
-                "messages":    messages,
-                "temperature": temperature,
-                "max_tokens":  max_tokens,
-            },
-        )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"]
+    _MAX_RETRIES = 4
+    _BASE_DELAY  = 2.0  # seconds
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for attempt in range(_MAX_RETRIES):
+            resp = await client.post(
+                "https://api.cerebras.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {settings.cerebras_api_key}",
+                    "Content-Type":  "application/json",
+                },
+                json={
+                    "model":       settings.cerebras_model,
+                    "messages":    messages,
+                    "temperature": temperature,
+                    "max_tokens":  max_tokens,
+                },
+            )
+
+            if resp.status_code == 429:
+                # Honour Retry-After if provided, otherwise exponential backoff
+                retry_after = resp.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else _BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "Cerebras 429 rate-limit (attempt %d/%d) — retrying in %.1fs",
+                    attempt + 1, _MAX_RETRIES, delay,
+                )
+                if attempt < _MAX_RETRIES - 1:
+                    await asyncio.sleep(delay)
+                    continue
+                # Last attempt failed — raise so caller gets a clear error
+                resp.raise_for_status()
+
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"]
+
+    raise RuntimeError("Cerebras request failed after retries")
 
 
 # ── Public interface ──────────────────────────────────────────────────────────

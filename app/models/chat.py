@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Text, DateTime, ForeignKey, Index, UniqueConstraint
+from sqlalchemy import Column, String, Text, DateTime, ForeignKey, Index, UniqueConstraint, Boolean
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
 
@@ -14,6 +14,7 @@ class ChatChannel(Base):
     type       = Column(String(20), nullable=False, default="general")
     pod        = Column(String(100), nullable=True)
     created_by = Column(UUID(as_uuid=False), ForeignKey("users.id"), nullable=True)
+    is_private = Column(Boolean, nullable=False, default=False)
     created_at = Column(DateTime, default=now, nullable=False)
 
     messages    = relationship("ChatMessage", back_populates="channel", cascade="all, delete")

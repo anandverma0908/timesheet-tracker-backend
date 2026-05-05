@@ -162,7 +162,7 @@ async def guest_me(
 async def guest_tickets(
     db:             Session = Depends(get_db),
     x_guest_token:  Optional[str] = Header(None, alias="X-Guest-Token"),
-    limit:          int = Query(50, le=200),
+    limit:          int = Query(50, le=1000),
     offset:         int = Query(0),
 ):
     """List tickets visible to this guest (filtered by allowed_pods / allowed_tickets)."""

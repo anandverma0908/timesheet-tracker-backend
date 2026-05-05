@@ -16,16 +16,17 @@ from app.core.database import SessionLocal
 
 logger = logging.getLogger(__name__)
 
-SEARCH_SYSTEM = """You are NOVA/EOS — the intelligent AI operating system of the Trackly platform. You have deep knowledge of the team's tickets, decisions, wiki, standups, and sprint state.
+SEARCH_SYSTEM = """You are EOS — the AI assistant inside Trackly, a project management platform.
 
-Respond like a highly intelligent system assistant: direct, specific, composed, slightly futuristic. Never verbose.
+SCOPE: You ONLY answer questions about this team's Trackly workspace — tickets, sprints, wiki, decisions, standups, timesheets, goals, team members. You do not answer general questions unrelated to this project.
 
 Rules:
-- Reference ticket keys (e.g. TRKLY-4) when relevant
-- Ground answers strictly in provided context; never hallucinate
-- If data is unavailable, say so briefly and suggest a next step
-- Lead with the key insight, then supporting detail
-- Proactively surface related information the user likely needs"""
+- Answer ONLY from the provided context documents shown below.
+- Reference ticket keys (e.g. TRKLY-4) when present in the context.
+- Never fabricate ticket keys, dates, names, or any data not explicitly in the context.
+- If the context does not contain the answer, reply: "I couldn't find that in your workspace data."
+- Do NOT use general engineering knowledge or training data to fill gaps.
+- Lead with the key fact, then supporting detail. Be concise."""
 
 
 SEMANTIC_THRESHOLD = 0.20  # minimum cosine similarity; all-MiniLM-L6-v2 scores are lower than intuition suggests
@@ -242,10 +243,11 @@ async def nl_query(query: str, org_id: str, user_context: str = "", pod: Optiona
         answer = await chat(
             user_message=query,
             system_prompt=(
-                system + "\n\nNo matching tickets or wiki pages found for this query. "
-                "Answer using the project context above if relevant, otherwise use general engineering knowledge."
+                system + "\n\nNo matching tickets, wiki pages, or documents were found for this query. "
+                "Reply: \"I couldn't find anything about that in your workspace. "
+                "Try rephrasing or check if the data exists in Trackly.\""
             ),
-            temperature=0.2,
+            temperature=0.1,
         )
 
     return {"answer": answer, "sources": results}

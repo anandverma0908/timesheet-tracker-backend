@@ -298,11 +298,10 @@ async def get_my_work(
     now   = datetime.now()
 
     # ── DB queries ────────────────────────────────────────────────────────────
-    # Try assigned tickets first; fall back to all open sprint tickets so the
-    # page always has data even when nothing is assigned directly to this user.
-    assigned_tickets = db.query(JiraTicket).filter(
-        JiraTicket.org_id    == user.org_id,
-        JiraTicket.assignee  == user.name,
+    # Always scope to tickets assigned to the logged-in user only.
+    all_tickets = db.query(JiraTicket).filter(
+        JiraTicket.org_id     == user.org_id,
+        JiraTicket.assignee   == user.name,
         JiraTicket.is_deleted == False,
     ).all()
 
@@ -311,24 +310,9 @@ async def get_my_work(
         SprintModel.status  == "active",
     ).first()
 
-    # If user has no assigned open tickets, widen scope to the entire active sprint
-    assigned_open = [t for t in assigned_tickets if (t.status or "") not in DONE]
-    if assigned_open:
-        all_tickets = assigned_tickets
-    elif active_sprint:
-        all_tickets = db.query(JiraTicket).filter(
-            JiraTicket.sprint_id  == active_sprint.id,
-            JiraTicket.org_id     == user.org_id,
-            JiraTicket.is_deleted == False,
-        ).all()
-    else:
-        all_tickets = db.query(JiraTicket).filter(
-            JiraTicket.org_id     == user.org_id,
-            JiraTicket.is_deleted == False,
-        ).order_by(JiraTicket.synced_at.desc()).limit(20).all()
-
     open_tickets = [t for t in all_tickets if (t.status or "") not in DONE]
 
+    # Sprint-level tickets used only for sprint progress stats (not shown as user's tasks)
     sprint_tickets: list = []
     if active_sprint:
         sprint_tickets = db.query(JiraTicket).filter(
@@ -337,10 +321,12 @@ async def get_my_work(
             JiraTicket.is_deleted == False,
         ).all()
 
+    # Worklogs scoped strictly to the logged-in user
     cutoff   = today - timedelta(days=14)
     worklogs = db.query(Worklog).join(JiraTicket).filter(
-        JiraTicket.org_id   == user.org_id,
-        Worklog.log_date    >= cutoff,
+        JiraTicket.org_id      == user.org_id,
+        Worklog.author_email   == user.email,
+        Worklog.log_date       >= cutoff,
     ).all()
 
     # ── Deterministic stats ───────────────────────────────────────────────────

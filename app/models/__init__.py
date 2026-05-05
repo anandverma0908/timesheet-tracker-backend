@@ -31,5 +31,5 @@ from app.models.code_review import CodeReviewSnapshot  # noqa: F401
 from app.models.knowledge   import Decision, Process   # noqa: F401
 from app.models.integration import Integration          # noqa: F401
 from app.models.guest       import GuestAccessToken     # noqa: F401
-from app.models.chat       import ChatChannel, ChatMessage  # noqa: F401
+from app.models.chat       import ChatChannel, ChatMessage, ChatChannelMember  # noqa: F401
 from app.models.form        import FormTemplate, FormSubmission  # noqa: F401

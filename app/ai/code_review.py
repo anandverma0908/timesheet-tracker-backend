@@ -93,6 +93,57 @@ Each bug must use this structure:
   }}
 ]"""
 
+_PR_SYSTEM_PROMPT = (
+    "You are EOS, a senior AI code reviewer for Trackly. Review pull-request diffs with production judgment. "
+    "Focus on issues introduced or exposed by the changed lines: correctness bugs, security problems, performance "
+    "regressions, expensive renders or queries, broken API/UI contracts, missing error handling, incomplete work, "
+    "and high-signal optimization or maintainability suggestions. Do not nitpick style. Always cite files and lines."
+)
+
+_PR_PROMPT_TMPL = """\
+You are EOS reviewing a pull request to `{github_repo}`.
+PR #{pr_number}: "{title}" by {author}
+Branch: {head_branch} -> {base_branch}
+
+These files were changed in this PR. Each section includes GitHub's unified diff patch and, when available, the current file content at the PR head.
+
+{file_context}
+
+Find only high-signal findings introduced or exposed by these changes. Include:
+- bugs and regressions
+- performance or scalability issues
+- security/data-leak risks
+- broken existing contracts between frontend/backend/modules
+- incomplete PR work, missing migrations, missing route wiring, missing tests, or dead UI controls
+- concrete optimizations when the current diff creates measurable waste or complexity
+
+Respond with ONLY a JSON array. Start your response with [ and end with ].
+If the PR looks clean, respond with exactly: []
+
+Each finding must use this structure:
+[
+  {{
+    "id": "short-kebab-id",
+    "title": "Specific finding title",
+    "area": "Feature area (e.g. Auth, API, Code Review, Performance)",
+    "category": "bug|performance|security|optimization|contract|incomplete|test_gap",
+    "severity": "critical|high|medium",
+    "summary": "One sentence: what is wrong or risky",
+    "impact": "What users, developers, or production systems experience",
+    "whyValid": "Why this is valid, grounded in the patch/full content",
+    "evidence": ["specific code fact 1", "specific code fact 2"],
+    "reproduction": ["Step 1", "Step 2", "Expected vs actual"],
+    "files": [{{"path": "path/to/file.ts", "line": 42}}],
+    "suggestion": "Concrete fix or optimization direction",
+    "ticketDraft": {{
+      "title": "Ticket title",
+      "description": "Description with acceptance criteria",
+      "labels": ["bug"],
+      "pod": "Engineering"
+    }}
+  }}
+]"""
+
 
 # ── GitHub helpers ────────────────────────────────────────────────────────────
 
@@ -232,6 +283,137 @@ def _dedupe_findings(findings: list[dict]) -> list[dict]:
     return result
 
 
+def _normalise_finding(finding: dict, default_repo: str = "Engineering") -> dict:
+    severity = str(finding.get("severity") or "medium").lower()
+    if severity not in {"critical", "high", "medium"}:
+        severity = "medium"
+    files = finding.get("files") if isinstance(finding.get("files"), list) else []
+    clean_files: list[dict] = []
+    for file_ref in files:
+        if not isinstance(file_ref, dict) or not file_ref.get("path"):
+            continue
+        line = file_ref.get("line")
+        clean_files.append({
+            "path": str(file_ref.get("path")),
+            "line": int(line) if isinstance(line, int) or (isinstance(line, str) and line.isdigit()) else None,
+        })
+
+    ticket = finding.get("ticketDraft") if isinstance(finding.get("ticketDraft"), dict) else {}
+    labels = ticket.get("labels") if isinstance(ticket.get("labels"), list) else []
+    category = str(finding.get("category") or "bug").lower()
+    if category not in {"bug", "performance", "security", "optimization", "contract", "incomplete", "test_gap"}:
+        category = "bug"
+
+    return {
+        **finding,
+        "severity": severity,
+        "category": category,
+        "title": str(finding.get("title") or "PR review finding"),
+        "area": str(finding.get("area") or "Code Review"),
+        "summary": str(finding.get("summary") or "EOS found an issue in this PR."),
+        "impact": str(finding.get("impact") or "This may affect correctness, reliability, or maintainability."),
+        "whyValid": str(finding.get("whyValid") or finding.get("summary") or "Grounded in the PR diff."),
+        "evidence": [str(x) for x in finding.get("evidence", []) if x] or ["See affected file and patch context."],
+        "reproduction": [str(x) for x in finding.get("reproduction", []) if x] or ["Review the changed code path called out by EOS."],
+        "files": clean_files,
+        "suggestion": str(finding.get("suggestion") or ""),
+        "ticketDraft": {
+            "title": str(ticket.get("title") or finding.get("title") or "Fix PR review finding"),
+            "description": str(ticket.get("description") or finding.get("summary") or ""),
+            "labels": [str(label) for label in labels] or [category.replace("_", "-")],
+            "pod": str(ticket.get("pod") or default_repo),
+        },
+    }
+
+
+async def _fetch_pull_request(client: httpx.AsyncClient, github_repo: str, pr_number: int) -> dict:
+    url = f"{_GH_BASE}/repos/{github_repo}/pulls/{pr_number}"
+    resp = await client.get(url, headers=_gh_headers())
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _fetch_pr_files(client: httpx.AsyncClient, github_repo: str, pr_number: int) -> list[dict]:
+    files: list[dict] = []
+    page = 1
+    while page <= 3:  # 300 files is far above the intended PR-review scope.
+        url = f"{_GH_BASE}/repos/{github_repo}/pulls/{pr_number}/files"
+        resp = await client.get(url, params={"per_page": 100, "page": page}, headers=_gh_headers())
+        resp.raise_for_status()
+        chunk = resp.json()
+        if not isinstance(chunk, list) or not chunk:
+            break
+        files.extend(chunk)
+        if len(chunk) < 100:
+            break
+        page += 1
+    return files
+
+
+async def _fetch_content_at_ref(
+    client: httpx.AsyncClient,
+    github_repo: str,
+    path: str,
+    ref: str,
+) -> str:
+    if not _is_eligible(path):
+        return ""
+    url = f"{_GH_BASE}/repos/{github_repo}/contents/{path}"
+    try:
+        resp = await client.get(url, params={"ref": ref}, headers=_gh_headers())
+        if resp.status_code == 404:
+            return ""
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("type") != "file":
+            return ""
+        raw = data.get("content", "")
+        if data.get("encoding") == "base64":
+            content = base64.b64decode(raw.replace("\n", "")).decode("utf-8", errors="ignore")
+        else:
+            content = raw
+        if len(content) > _MAX_FILE_CHARS:
+            content = content[:_MAX_FILE_CHARS] + "\n... [truncated]"
+        return content
+    except Exception as exc:
+        logger.debug("Failed to fetch PR content %s@%s: %s", path, ref, exc)
+        return ""
+
+
+async def _build_pr_file_context(
+    client: httpx.AsyncClient,
+    github_repo: str,
+    pr_files: list[dict],
+    head_sha: str,
+) -> tuple[str, list[str]]:
+    eligible = [
+        file
+        for file in pr_files
+        if file.get("status") != "removed" and _is_eligible(str(file.get("filename") or ""))
+    ][:50]
+    sem = asyncio.Semaphore(_GH_FETCH_CONCURRENCY)
+
+    async def build_one(file: dict) -> tuple[str, str]:
+        path = str(file.get("filename") or "")
+        async with sem:
+            content = await _fetch_content_at_ref(client, github_repo, path, head_sha)
+        patch = str(file.get("patch") or "")
+        if len(patch) > 5000:
+            patch = patch[:5000] + "\n... [patch truncated]"
+        section = (
+            f"=== {path} (patch) ===\n{patch or '[No patch available from GitHub, likely binary or too large]'}\n\n"
+            f"=== {path} (full content) ===\n{content or '[Content unavailable or skipped]'}"
+        )
+        return path, section
+
+    results = await asyncio.gather(*[build_one(file) for file in eligible])
+    changed_files = [path for path, _ in results]
+    file_context = "\n\n".join(section for _, section in results)
+    if len(file_context) > 120_000:
+        file_context = file_context[:120_000] + "\n... [PR context truncated]"
+    return file_context, changed_files
+
+
 # ── Batch analysis ────────────────────────────────────────────────────────────
 
 async def _analyse_batch(
@@ -333,3 +515,53 @@ async def run_code_review(github_repo: str) -> tuple[list[dict], str, list[str]]
         len(final), len(scanned_files), total_batches, snapshot_id,
     )
     return final, snapshot_id, scanned_files
+
+
+async def run_pr_review(github_repo: str, pr_number: int) -> tuple[list[dict], list[str]]:
+    """
+    Review only files changed in a GitHub pull request using diff-focused EOS analysis.
+
+    Returns:
+        findings      – validated PR findings (bugs, perf, security, contracts, suggestions)
+        changed_files – source files included in the PR review context
+    """
+    async with httpx.AsyncClient(timeout=_GH_TIMEOUT) as client:
+        pull = await _fetch_pull_request(client, github_repo, pr_number)
+        pr_files = await _fetch_pr_files(client, github_repo, pr_number)
+        head_sha = pull.get("head", {}).get("sha") or pull.get("head", {}).get("ref") or "HEAD"
+        file_context, changed_files = await _build_pr_file_context(client, github_repo, pr_files, head_sha)
+
+    if not changed_files or not file_context.strip():
+        logger.warning("No eligible changed source files found for %s PR #%s", github_repo, pr_number)
+        return [], changed_files
+
+    prompt = _PR_PROMPT_TMPL.format(
+        github_repo=github_repo,
+        pr_number=pr_number,
+        title=pull.get("title") or "",
+        author=(pull.get("user") or {}).get("login") or "unknown",
+        head_branch=(pull.get("head") or {}).get("ref") or "",
+        base_branch=(pull.get("base") or {}).get("ref") or "",
+        file_context=file_context,
+    )
+
+    from app.ai.nova import chat
+
+    try:
+        raw = await chat(
+            user_message=prompt,
+            system_prompt=_PR_SYSTEM_PROMPT,
+            temperature=0.1,
+            max_tokens=4500,
+        )
+    except Exception as exc:
+        logger.error("PR review NOVA call failed for %s PR #%s: %s", github_repo, pr_number, exc)
+        raise
+
+    findings = [_normalise_finding(f) for f in _parse_findings(raw)]
+    final = _dedupe_findings(findings)
+    logger.info(
+        "EOS PR review complete: %d finding(s), %d changed file(s), %s PR #%s",
+        len(final), len(changed_files), github_repo, pr_number,
+    )
+    return final, changed_files

@@ -33,6 +33,7 @@ from app.api.routes.audit          import router as audit_router
 from app.api.routes.chat           import router as chat_router
 from app.api.routes.forms          import router as forms_router
 from app.api.routes.guest          import router as guest_router
+from app.api.routes.webhooks       import router as webhooks_router
 
 api_router = APIRouter()
 
@@ -63,3 +64,4 @@ api_router.include_router(audit_router)
 api_router.include_router(chat_router)
 api_router.include_router(forms_router)
 api_router.include_router(guest_router)
+api_router.include_router(webhooks_router)

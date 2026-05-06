@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app.core.dependencies import get_current_user, get_db
 from app.models.user import User
 from app.models.code_review import CodeReviewSnapshot
+from app.models.pr_review import PRReview
 from app.ai.code_review import get_configured_repos, run_code_review
 
 logger = logging.getLogger(__name__)
@@ -174,4 +175,72 @@ def get_snapshot(
         "scanned_files":       snap.scanned_files or [],
         "findings":            snap.findings or [],
         "run_at":              snap.run_at.isoformat() if snap.run_at else None,
+    }
+
+
+# ── Pull-request review history ──────────────────────────────────────────────
+
+def _pr_review_summary(row: PRReview) -> dict:
+    return {
+        "id":                  row.id,
+        "github_repo":         row.github_repo,
+        "pr_number":           row.pr_number,
+        "pr_title":            row.pr_title,
+        "pr_author":           row.pr_author,
+        "pr_url":              row.pr_url,
+        "base_branch":         row.base_branch,
+        "head_branch":         row.head_branch,
+        "linked_tickets":      row.linked_tickets or [],
+        "changed_files_count": len(row.changed_files or []),
+        "status":              row.status,
+        "total_count":         row.total_count,
+        "critical_count":      row.critical_count,
+        "high_count":          row.high_count,
+        "medium_count":        row.medium_count,
+        "created_at":          row.created_at.isoformat() if row.created_at else None,
+        "analyzed_at":         row.analyzed_at.isoformat() if row.analyzed_at else None,
+    }
+
+
+@router.get("/pr-reviews")
+def list_pr_reviews(
+    repo: str = Query(..., description="github repo slug, e.g. org/repo"),
+    limit: int = Query(50, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    rows = (
+        db.query(PRReview)
+        .filter(
+            PRReview.org_id == str(current_user.org_id),
+            PRReview.github_repo == repo,
+        )
+        .order_by(PRReview.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return {"pr_reviews": [_pr_review_summary(row) for row in rows]}
+
+
+@router.get("/pr-reviews/{review_id}")
+def get_pr_review(
+    review_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    review = (
+        db.query(PRReview)
+        .filter(
+            PRReview.id == review_id,
+            PRReview.org_id == str(current_user.org_id),
+        )
+        .first()
+    )
+    if not review:
+        raise HTTPException(status_code=404, detail="PR review not found")
+
+    return {
+        **_pr_review_summary(review),
+        "changed_files": review.changed_files or [],
+        "findings": review.findings or [],
     }

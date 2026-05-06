@@ -6,6 +6,7 @@ os.getenv() directly in route handlers or services.
 """
 
 from functools import lru_cache
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -51,6 +52,7 @@ class Settings(BaseSettings):
     # ── GitHub integration ────────────────────────────────────────────────────
     github_token: str = ""          # Personal Access Token with repo scope
     github_repos: str = ""          # Comma-separated list: "org/repo1,org/repo2,org/repo3"
+    github_webhook_secret: str = "" # Secret used to verify GitHub webhook signatures
     code_context_local_repos: str = ""      # Semicolon-separated: "name|/abs/path|org/repo;..."
     code_context_repo_search_roots: str = ""  # Semicolon-separated roots to scan for local git repos
 
@@ -63,6 +65,15 @@ class Settings(BaseSettings):
     smtp_email: str = ""
     smtp_password: str = ""
     email_from_name: str = "Trackly"
+
+    @field_validator("debug", "dev_mode", mode="before")
+    @classmethod
+    def _parse_boolish(cls, value):
+        if isinstance(value, str):
+            normalised = value.strip().lower()
+            if normalised in {"release", "prod", "production"}:
+                return False
+        return value
 
     model_config = SettingsConfigDict(
         env_file=".env",

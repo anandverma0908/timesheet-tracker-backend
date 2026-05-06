@@ -12,15 +12,9 @@ if [ -n "${PGHOST}" ]; then
 fi
 
 echo "🏗️  Creating base tables (idempotent)..."
-python - <<'EOF'
-import app.models  # noqa — registers all ORM models
-from app.core.database import Base, engine
-Base.metadata.create_all(bind=engine)
-print("Base tables ready.")
-EOF
+python scripts/init_db.py
 
 echo "🔄 Running migrations..."
-# Use direct (non-pooled) URL for migrations if provided, else fall back to DATABASE_URL
 MIGRATE_URL="${DATABASE_URL_DIRECT:-$DATABASE_URL}"
 DATABASE_URL="$MIGRATE_URL" alembic upgrade head
 echo "✅ Migrations done"

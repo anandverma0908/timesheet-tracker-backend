@@ -447,10 +447,10 @@ async def restore_version(
     background_tasks: BackgroundTasks,
     version:          int     = Query(..., description="Version number to restore"),
     db:      Session = Depends(get_db),
-    manager: User    = Depends(get_manager_up),
+    user:    User    = Depends(get_editor),
 ):
     page = db.query(WikiPage).filter(
-        WikiPage.id == page_id, WikiPage.org_id == manager.org_id
+        WikiPage.id == page_id, WikiPage.org_id == user.org_id
     ).first()
     if not page:
         raise HTTPException(404, "Page not found")
@@ -465,7 +465,7 @@ async def restore_version(
     db.add(WikiVersion(
         id=gen_uuid(), page_id=page.id,
         version=page.version, content_md=page.content_md,
-        author_id=manager.id,
+        author_id=user.id,
     ))
 
     from app.models.base import now as _now

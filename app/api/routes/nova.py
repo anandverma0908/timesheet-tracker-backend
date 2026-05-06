@@ -771,20 +771,8 @@ async def get_team_standups(
         ).all()
     ]
 
-    if user.role == "admin":
-        visible_user_ids = None  # sees everyone
-
-    elif user.role == "engineering_manager":
-        # reporting_to stores name, emp_no, or id — match any
-        manager_identifiers = [v for v in [user.name, user.emp_no, str(user.id)] if v]
-        visible_user_ids = [
-            u.id for u in db.query(UserModel).filter(
-                UserModel.org_id == user.org_id,
-                UserModel.reporting_to.in_(manager_identifiers),
-            ).all()
-        ]
-        # Always include own standup
-        visible_user_ids.append(str(user.id))
+    if user.role in ("admin", "engineering_manager"):
+        visible_user_ids = None  # sees all org members
 
     else:  # tech_lead — pod-mates
         user_pods = [p.strip() for p in (user.pod or "").split(",") if p.strip()]
@@ -850,8 +838,8 @@ async def update_standup(
     if not standup:
         raise HTTPException(404, "Standup not found")
 
-    # Enforce ownership (unless manager/admin)
-    if standup.user_id != user.id and user.role not in ("admin", "engineering_manager"):
+    # Enforce ownership — only the standup owner can edit
+    if standup.user_id != user.id:
         raise HTTPException(403, "You can only edit your own standup")
 
     if body.yesterday is not None:

@@ -1,7 +1,8 @@
 """
-app/api/routes/filters.py — Saved Filters CRUD.
+app/api/routes/filters.py — Saved Filters CRUD + Filter Options.
 
 Endpoints:
+  GET    /api/filters/options   → distinct pods, clients, users, projects for dropdowns
   GET    /api/filters          → list own + shared filters
   POST   /api/filters          → create filter
   DELETE /api/filters/{id}     → delete filter
@@ -11,12 +12,51 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy import distinct
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.saved_filter import SavedFilter
 
 router = APIRouter(prefix="/api/filters", tags=["filters"])
+
+
+@router.get("/options")
+async def get_filter_options(
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """Return distinct pods, clients, users, and projects for dropdown population."""
+    from app.models.ticket import JiraTicket
+    from app.models.user import User
+
+    base = JiraTicket.org_id == user.org_id, JiraTicket.is_deleted == False
+
+    pods = sorted({
+        row[0] for row in
+        db.query(distinct(JiraTicket.pod)).filter(*base).all()
+        if row[0]
+    })
+
+    clients = sorted({
+        row[0] for row in
+        db.query(distinct(JiraTicket.client)).filter(*base).all()
+        if row[0]
+    })
+
+    users = sorted({
+        row[0] for row in
+        db.query(distinct(User.name)).filter(User.org_id == user.org_id).all()
+        if row[0]
+    })
+
+    projects = sorted({
+        row[0] for row in
+        db.query(distinct(JiraTicket.project_key)).filter(*base).all()
+        if row[0]
+    })
+
+    return {"pods": pods, "clients": clients, "users": users, "projects": projects}
 
 
 class FilterCreatePayload(BaseModel):

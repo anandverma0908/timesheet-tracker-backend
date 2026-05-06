@@ -12,7 +12,7 @@ if [ -n "${PGHOST}" ]; then
 fi
 
 echo "🏗️  Creating base tables (idempotent)..."
-python scripts/init_db.py
+PYTHONPATH=/app python scripts/init_db.py
 
 echo "🔄 Running migrations..."
 MIGRATE_URL="${DATABASE_URL_DIRECT:-$DATABASE_URL}"

@@ -132,8 +132,16 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS — tighten to frontend_url in production
-    origins = ["*"] if settings.dev_mode else [settings.frontend_url]
+    # CORS — open in dev, locked to frontend_url in production
+    origins = (
+        ["*"]
+        if settings.dev_mode
+        else [
+            settings.frontend_url,
+            "http://localhost:3000",
+            "http://localhost:5173",
+        ]
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,

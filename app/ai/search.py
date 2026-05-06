@@ -203,6 +203,97 @@ async def keyword_search_tickets(query: str, org_id: str, limit: int = 8, pod: O
         db.close()
 
 
+def _search_decisions(query: str, org_id: str, limit: int = 3) -> list[dict]:
+    """Keyword search over decisions table — returns context-ready dicts."""
+    db = SessionLocal()
+    try:
+        words = [w for w in re.split(r"\W+", query.lower()) if len(w) > 2]
+        if not words:
+            return []
+        conditions = " OR ".join(
+            f"(lower(d.title) LIKE :w{i} OR lower(d.decision) LIKE :w{i} OR lower(d.context) LIKE :w{i})"
+            for i in range(len(words))
+        )
+        params = {f"w{i}": f"%{w}%" for i, w in enumerate(words)}
+        params["org_id"] = org_id
+        rows = db.execute(text(f"""
+            SELECT d.id, d.number, d.title, d.status, d.owner, d.date,
+                   d.context, d.decision, d.rationale, d.consequences
+            FROM decisions d
+            WHERE d.org_id = :org_id
+              AND d.is_deleted = false
+              AND ({conditions})
+            ORDER BY d.number DESC
+            LIMIT {limit}
+        """), params).fetchall()
+        results = []
+        for r in rows:
+            r = dict(r._mapping)
+            results.append({
+                "source_type": "decision",
+                "key": f"DEC-{r['number']}",
+                "title": r["title"],
+                "snippet": "\n".join(filter(None, [
+                    r.get("context") or "",
+                    r.get("decision") or "",
+                    r.get("rationale") or "",
+                    r.get("consequences") or "",
+                ]))[:800],
+                "status": r.get("status"),
+                "owner": r.get("owner"),
+                "date": r.get("date"),
+            })
+        return results
+    except Exception as e:
+        logger.warning(f"Decision search failed: {e}")
+        return []
+    finally:
+        db.close()
+
+
+def _search_standups(query: str, org_id: str, limit: int = 3) -> list[dict]:
+    """Keyword search over standups table — returns context-ready dicts."""
+    db = SessionLocal()
+    try:
+        words = [w for w in re.split(r"\W+", query.lower()) if len(w) > 2]
+        if not words:
+            return []
+        conditions = " OR ".join(
+            f"(lower(s.yesterday) LIKE :w{i} OR lower(s.today) LIKE :w{i} OR lower(s.blockers) LIKE :w{i})"
+            for i in range(len(words))
+        )
+        params = {f"w{i}": f"%{w}%" for i, w in enumerate(words)}
+        params["org_id"] = str(org_id)
+        rows = db.execute(text(f"""
+            SELECT s.id, s.date, s.yesterday, s.today, s.blockers, u.name as author
+            FROM standups s
+            LEFT JOIN users u ON u.id = s.user_id
+            WHERE s.org_id = :org_id::uuid
+              AND ({conditions})
+            ORDER BY s.date DESC
+            LIMIT {limit}
+        """), params).fetchall()
+        results = []
+        for r in rows:
+            r = dict(r._mapping)
+            results.append({
+                "source_type": "standup",
+                "key": str(r["id"])[:8],
+                "title": f"Standup — {r.get('author','Team')} · {r.get('date','')}",
+                "snippet": "\n".join(filter(None, [
+                    f"Yesterday: {r.get('yesterday','')}" if r.get("yesterday") else "",
+                    f"Today: {r.get('today','')}" if r.get("today") else "",
+                    f"Blockers: {r.get('blockers','')}" if r.get("blockers") else "",
+                ]))[:600],
+            })
+        return results
+    except Exception as e:
+        logger.warning(f"Standup search failed: {e}")
+        return []
+    finally:
+        db.close()
+
+
 async def nl_query(query: str, org_id: str, user_context: str = "", pod: Optional[str] = None) -> dict:
     allowed_pods = {pod} if pod else None
     try:
@@ -211,22 +302,38 @@ async def nl_query(query: str, org_id: str, user_context: str = "", pod: Optiona
         semantic = []
     good_semantic = [r for r in semantic if (r.get("similarity") or 0) >= 0.55]
 
-    # Always try keyword search in parallel to supplement or replace semantic results
+    # Keyword search tickets, decisions, standups in parallel
     keyword_results = await keyword_search_tickets(query, org_id, limit=8, pod=pod)
+    decision_results = _search_decisions(query, org_id, limit=3)
+    standup_results  = _search_standups(query, org_id, limit=3)
 
-    # Merge: prefer good semantic, fill with keyword results not already included
+    # Merge: semantic first, then keyword tickets, then decisions/standups
     seen_keys = {r.get("key") for r in good_semantic}
-    merged = list(good_semantic) + [r for r in keyword_results if r.get("key") not in seen_keys]
-    results = merged[:8]
+    merged = list(good_semantic)
+    for r in keyword_results:
+        if r.get("key") not in seen_keys:
+            merged.append(r)
+            seen_keys.add(r.get("key"))
+    for r in decision_results + standup_results:
+        if r.get("key") not in seen_keys:
+            merged.append(r)
+            seen_keys.add(r.get("key"))
+    results = merged[:10]
 
     # Build context docs
     contexts = []
     for r in results:
-        if r.get("source_type") == "ticket":
+        stype = r.get("source_type", "doc")
+        if stype == "ticket":
             meta = f"{r.get('issue_type','?')} · {r.get('status','?')} · {r.get('priority','?')}"
             contexts.append(f"[TICKET] {r['key']} ({meta})\nTitle: {r['title']}\n{r.get('snippet','')}")
+        elif stype == "decision":
+            meta = f"status: {r.get('status','?')} · owner: {r.get('owner','?')} · date: {r.get('date','?')}"
+            contexts.append(f"[DECISION] {r['key']} ({meta})\nTitle: {r['title']}\n{r.get('snippet','')}")
+        elif stype == "standup":
+            contexts.append(f"[STANDUP] {r['title']}\n{r.get('snippet','')}")
         else:
-            contexts.append(f"[{r.get('source_type','doc').upper()}] {r.get('key','')} — {r['title']}\n{r.get('snippet','')}")
+            contexts.append(f"[{stype.upper()}] {r.get('key','')} — {r['title']}\n{r.get('snippet','')}")
 
     system = SEARCH_SYSTEM
     if user_context:
@@ -243,7 +350,7 @@ async def nl_query(query: str, org_id: str, user_context: str = "", pod: Optiona
         answer = await chat(
             user_message=query,
             system_prompt=(
-                system + "\n\nNo matching tickets, wiki pages, or documents were found for this query. "
+                system + "\n\nNo matching tickets, wiki pages, decisions, or standups were found for this query. "
                 "Reply: \"I couldn't find anything about that in your workspace. "
                 "Try rephrasing or check if the data exists in Trackly.\""
             ),

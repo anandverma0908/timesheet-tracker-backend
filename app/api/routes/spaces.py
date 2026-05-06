@@ -1285,11 +1285,11 @@ async def get_board_config(
     if not config:
         return {
             "columns": [
-                {"id": "To Do", "name": "To Do", "status_mapping": ["To Do", "Open", "Reopened"]},
-                {"id": "In Progress", "name": "In Progress", "status_mapping": ["In Progress"]},
-                {"id": "In Review", "name": "In Review", "status_mapping": ["In Review"]},
-                {"id": "Blocked", "name": "Blocked", "status_mapping": ["Blocked"]},
-                {"id": "Done", "name": "Done", "status_mapping": ["Done", "Closed", "Resolved"]},
+                {"id": "To Do",      "name": "To Do",      "status_mapping": ["To Do", "Open", "Reopened"], "allowed_transitions": ["In Progress", "Blocked"]},
+                {"id": "In Progress","name": "In Progress", "status_mapping": ["In Progress"],               "allowed_transitions": ["In Review", "Blocked"]},
+                {"id": "In Review",  "name": "In Review",  "status_mapping": ["In Review"],                 "allowed_transitions": ["Done", "Blocked", "In Progress"]},
+                {"id": "Blocked",    "name": "Blocked",    "status_mapping": ["Blocked"],                   "allowed_transitions": ["In Progress", "In Review"]},
+                {"id": "Done",       "name": "Done",       "status_mapping": ["Done", "Closed", "Resolved"],"allowed_transitions": []},
             ],
             "swimlane_by": "none",
             "wip_limits": {},
@@ -1382,10 +1382,26 @@ async def get_pod_stories(
 
     stories = [t for t in sprint_tickets if (t.issue_type or "").lower() == "story"]
     ticket_by_id = {t.id: t for t in sprint_tickets}
+    story_ids = {s.id for s in stories}
+    # Build story→epic map for fallback linking
+    story_by_epic: dict = {}
+    for s in stories:
+        if s.epic_id:
+            story_by_epic.setdefault(s.epic_id, []).append(s.id)
+
     child_map: dict = {}
     for t in sprint_tickets:
-        if t.parent_id and t.parent_id in ticket_by_id:
+        if (t.issue_type or "").lower() == "story":
+            continue
+        if t.parent_id and t.parent_id in story_ids:
+            # Direct parent_id link
             child_map.setdefault(t.parent_id, []).append(t)
+        elif t.parent_id and t.parent_id in ticket_by_id:
+            # parent is a non-story ticket — skip
+            pass
+        elif t.epic_id and t.epic_id in story_by_epic:
+            # Fallback: link via shared epic_id (pick first matching story)
+            child_map.setdefault(story_by_epic[t.epic_id][0], []).append(t)
 
     today = _date.today()
 
@@ -1459,11 +1475,11 @@ async def get_pod_stories(
             "tasks": [_serialize_task(c) for c in children],
         })
 
-    story_ids = {s.id for s in stories}
+    linked_ids = {t.id for children in child_map.values() for t in children}
     unlinked = [
         t for t in sprint_tickets
         if (t.issue_type or "").lower() != "story"
-        and (not t.parent_id or t.parent_id not in story_ids)
+        and t.id not in linked_ids
     ]
     unlinked_done = sum(1 for t in unlinked if _normalize_status(t.status) == "Done")
 

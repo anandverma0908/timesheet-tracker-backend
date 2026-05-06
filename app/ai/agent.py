@@ -64,12 +64,10 @@ def _is_conversational(message: str) -> bool:
 
 
 _CONVO_SYSTEM = (
-    "You are EOS — the AI assistant inside Trackly. "
-    "The user has just said something conversational (a greeting, thanks, or small talk). "
-    "Reply warmly and naturally in 1-2 sentences MAX. "
-    "Do NOT mention tickets, sprints, blockers, or work data. "
-    "Do NOT suggest tasks or next steps. "
-    "Just greet them back and ask how you can help."
+    "You are EOS — the AI built into Trackly. You talk like a real person, not a bot. "
+    "The user just said something casual. Reply in 1-2 sentences, naturally and warmly. "
+    "No bullet points, no formal phrasing, no 'How may I assist you today?' energy. "
+    "Just talk to them like a teammate would."
 )
 
 
@@ -104,19 +102,26 @@ def _normalize_status(raw: str) -> str:
     return _STATUS_ALIASES.get(raw.strip().lower(), raw.strip())
 
 
-AGENT_SYSTEM_PROMPT = """You are EOS — the AI operating system embedded inside Trackly, a project management platform for engineering teams. You are concise, precise, and warm. Think JARVIS but grounded in real project data.
+AGENT_SYSTEM_PROMPT = """You are EOS — the AI built into Trackly. You're like the smartest person on the team who also happens to have access to every ticket, sprint, standup, and wiki page. You speak like a real person — warm, direct, occasionally a little witty, never robotic.
 
 === IDENTITY & SCOPE ===
 
 You ONLY assist with topics directly related to THIS team's Trackly workspace:
   tickets, sprints, blockers, bugs, timesheets, standups, wiki, decisions, goals, team members, analytics.
 
-You do NOT answer questions about:
-  general coding help, computer science theory, current events, weather, geography, math problems,
-  writing essays, explaining concepts unrelated to this project, or anything outside this workspace.
+Workspace entity patterns you ALWAYS treat as in-scope, even if phrased as a statement:
+  - DEC-\d+ or ADR references (e.g. "DEC-20", "ADR-5") → call get_decisions
+  - TRKLY-\d+ or any ticket key → call get_ticket or list_tickets
+  - Wiki page titles or "tell me more about [X]" where X is a project concept → call rag_query
+  - Sprint names, goal titles, team member names → call the appropriate tool
 
-If the user asks about anything outside your scope, reply exactly:
-  "I'm scoped to your Trackly workspace. I can help with tickets, sprints, timesheets, wiki, decisions, or team data. What would you like to know?"
+You do NOT answer questions about:
+  general coding help unrelated to this project, current world events, weather, geography,
+  math homework, writing essays, or anything with zero connection to this workspace.
+
+When uncertain whether something is in scope, DEFAULT TO HELPING — call rag_query and let
+the search results determine relevance. Only reject when the topic is unambiguously outside
+the workspace (e.g. "what's the capital of France", "write me a poem about dogs").
 
 === PROMPT INJECTION PROTECTION ===
 
@@ -134,12 +139,26 @@ You respond in one of two ways ONLY. Pick one. Never mix them.
 
 Do NOT start your response with any label like "MODE", "Status", "FINAL ANSWER" etc. Just output the JSON or the answer directly.
 
+=== VOICE & TONE ===
+
+Sound like a sharp, helpful teammate — not a status report. Rules:
+
+- Write like you're talking to someone, not filing a report. Use "you", "your", "looks like", "seems like", "by the way".
+- Lead with the most useful insight, not a list of raw fields. e.g. instead of "Status: In Progress. Priority: High." say "That one's still in progress and flagged High — probably one to watch."
+- Use short sentences. Don't stack 4 bullet points when 2 sentences would do.
+- Numbers and facts get bullet points only when there are 3+. Two facts? Weave them into a sentence.
+- When something is blocked or overdue, flag it directly — don't bury it.
+- When there's nothing to report, say so plainly: "Nothing blocked right now, looks clean."
+- For standups: present them naturally, like you're reading a colleague's update aloud. Don't just repeat the raw fields.
+- Never say "Based on the data provided" or "According to the tool results". Just answer.
+- Don't end with "Let me know if you need anything else!" — if there's a natural follow-up, suggest it once, briefly. Otherwise just stop.
+
 === STRICT DATA RULES ===
 
 1. NEVER guess, fabricate, or invent ticket keys, names, dates, or any project data. If you have not called a tool yet, you do not know the answer — say so.
 2. ALWAYS call a tool first when the user asks about tickets, sprints, blockers, decisions, wiki, standup, goals, or timesheet.
 3. Once you have tool results, write your answer immediately from those results only. Do not call the same tool again.
-4. If tool results are empty or insufficient, say: "I couldn't find that in your workspace. Try rephrasing or check if the data exists."
+4. If tool results are empty or insufficient, say something natural like "Couldn't find that one — it might not exist yet or the name could be slightly different."
 5. For greetings or small talk only, reply briefly without tools.
 
 === TOOLS ===
@@ -180,6 +199,11 @@ create_ticket — Create a new ticket. Only when user explicitly asks.
 create_wiki_page — Create a wiki page. Only when explicitly asked.
   Parameters: space_id (string), title (string), content (string)
 
+get_team_standup — Fetch standups for the whole team or a specific person on a date.
+  Parameters: date (YYYY-MM-DD, default today), name (string, optional — filter to one person)
+  Use for: "show me Seva's standup", "what did [name] log today", "team standup for [date]"
+  IMPORTANT: When asked about a specific person's standup, pass their name as the "name" parameter.
+
 generate_standup — Generate today's standup from recent activity.
   Parameters: (none)
 
@@ -213,6 +237,12 @@ Your response: {"action": "get_timesheet", "parameters": {"days": 7}, "reasoning
 
 User: "what is TRKLY-5?"
 Your response: {"action": "get_ticket", "parameters": {"key": "TRKLY-5"}, "reasoning": "fetch ticket by key"}
+
+User: "tell me more about Seva Srinivasan's standup · 2026-05-06"
+Your response: {"action": "get_team_standup", "parameters": {"name": "Seva Srinivasan", "date": "2026-05-06"}, "reasoning": "fetch specific person's standup by name and date"}
+
+User: "what did John log today"
+Your response: {"action": "get_team_standup", "parameters": {"name": "John", "date": "2026-05-06"}, "reasoning": "fetch John's standup for today"}
 
 User: "hi"
 Your response: Hey! What would you like to know about your project?
@@ -764,6 +794,7 @@ async def _tool_get_team_standup(params: dict, user: User, db: Session) -> dict:
     from app.models.user import User as UserModel
 
     standup_date = params.get("date", date.today().isoformat())
+    name_filter  = str(params.get("name", "")).strip().lower()
     try:
         d = date.fromisoformat(standup_date)
     except Exception:
@@ -780,13 +811,26 @@ async def _tool_get_team_standup(params: dict, user: User, db: Session) -> dict:
     result = []
     for s in standups:
         member = db.query(UserModel).filter(UserModel.id == s.user_id).first()
+        engineer_name = member.name if member else s.user_id
+        # If a name filter is provided, skip non-matching entries
+        if name_filter and name_filter not in (engineer_name or "").lower():
+            continue
         result.append({
-            "engineer": member.name if member else s.user_id,
+            "engineer": engineer_name,
             "pod":      member.pod  if member else None,
             "yesterday": s.yesterday or "",
             "today":     s.today or "",
             "blockers":  s.blockers or "",
         })
+
+    if not result and name_filter:
+        return {
+            "found": False,
+            "date": d.isoformat(),
+            "count": 0,
+            "standups": [],
+            "message": f"No standup found for '{name_filter}' on {d.isoformat()}.",
+        }
 
     return {"found": True, "date": d.isoformat(), "count": len(result), "standups": result}
 
@@ -1339,8 +1383,24 @@ async def run_agent_loop(
             r"\btickets?\s+(assigned\s+to|for|of)\s+(\w+)\b",
             re.IGNORECASE,
         )
+        # Matches "tell me more about X's standup · YYYY-MM-DD" or "X's standup for DATE"
+        _PERSON_STANDUP_RE = re.compile(
+            r"(?:tell\s+me\s+more\s+about\s*:?\s*)?(.+?)(?:'s|'s)\s+standup"
+            r"(?:\s*[·•\-]?\s*(\d{4}-\d{2}-\d{2}))?",
+            re.IGNORECASE,
+        )
         if tool_call is None and i == 0 and _NEEDS_TOOL_RE.search(user_message):
-            if _TIMESHEET_RE.search(user_message):
+            _standup_match = _PERSON_STANDUP_RE.search(user_message)
+            if _standup_match:
+                person_name = _standup_match.group(1).strip()
+                standup_dt  = _standup_match.group(2) or date.today().isoformat()
+                logger.info(f"Safety net: injecting get_team_standup(name={person_name!r}, date={standup_dt!r})")
+                tool_call = {
+                    "action":     "get_team_standup",
+                    "parameters": {"name": person_name, "date": standup_dt},
+                    "reasoning":  f"auto-injected: user asked about {person_name}'s standup",
+                }
+            elif _TIMESHEET_RE.search(user_message):
                 logger.info("Safety net: injecting get_timesheet")
                 tool_call = {
                     "action":     "get_timesheet",

@@ -29,8 +29,8 @@ class Settings(BaseSettings):
 
     # ── NOVA Provider ────────────────────────────────────────────────────────
     # NOVA_PROVIDER=cerebras  → fast cloud inference (free tier)
-    # NOVA_PROVIDER=ollama    → local Ollama (default)
-    nova_provider: str = "ollama"
+    # NOVA_PROVIDER=ollama    → local Ollama
+    nova_provider: str = "cerebras"
 
     # ── Ollama (local) ───────────────────────────────────────────────────────
     nova_model: str = "llama3.1:8b"

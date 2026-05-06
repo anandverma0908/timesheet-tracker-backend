@@ -21,21 +21,6 @@ services:
       timeout: 5s
       retries: 10
 
-  # ── Ollama (local LLM) ───────────────────────────────────────────────────
-  ollama:
-    image: ollama/ollama:latest
-    container_name: trackly-ollama
-    restart: unless-stopped
-    volumes:
-      - ollama_data:/root/.ollama
-    ports:
-      - "11434:11434"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 12
-
   # ── Trackly API ──────────────────────────────────────────────────────────
   api:
     build:
@@ -46,18 +31,15 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      ollama:
-        condition: service_healthy
     environment:
       DATABASE_URL: postgresql://trackly:trackly@postgres:5432/trackly
       JWT_SECRET: ${JWT_SECRET:-change-this-in-production}
-      NOVA_PROVIDER: ${NOVA_PROVIDER:-ollama}
-      NOVA_BASE_URL: http://ollama:11434
-      NOVA_MODEL: ${NOVA_MODEL:-llama3.1:8b}
+      NOVA_PROVIDER: cerebras
+      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY}
+      CEREBRAS_MODEL: ${CEREBRAS_MODEL:-llama3.1-8b}
       NOVA_TEMPERATURE: ${NOVA_TEMPERATURE:-0.3}
       NOVA_MAX_TOKENS: ${NOVA_MAX_TOKENS:-1500}
       EMBEDDING_MODEL: all-MiniLM-L6-v2
-      CEREBRAS_API_KEY: ${CEREBRAS_API_KEY:-}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
       SMTP_HOST: mailhog
       SMTP_PORT: 1025
@@ -83,5 +65,4 @@ services:
 
 volumes:
   postgres_data:
-  ollama_data:
   uploads:

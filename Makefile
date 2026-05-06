@@ -52,7 +52,7 @@ logs:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 nova-status:
-	curl -s http://localhost:11434/api/tags | python -m json.tool
+	curl -s http://localhost:8000/api/nova/status | python -m json.tool
 
 health:
 	curl -s http://localhost:8000/api/health | python -m json.tool

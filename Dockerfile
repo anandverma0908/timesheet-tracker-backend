@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir torch==2.4.0+cpu \
 # Install remaining dependencies
 RUN pip install --no-cache-dir -r requirements-prod.txt
 
+# Pre-download embedding model so cold starts don't fetch from HuggingFace
+RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
+
 COPY . .
 
 RUN mkdir -p uploads

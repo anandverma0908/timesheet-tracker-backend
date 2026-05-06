@@ -10,7 +10,7 @@ import logging
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -18,7 +18,8 @@ from app.core.dependencies import get_current_user, get_db
 from app.models.user import User
 from app.models.code_review import CodeReviewSnapshot
 from app.models.pr_review import PRReview
-from app.ai.code_review import get_configured_repos, run_code_review
+from app.models.ticket import JiraTicket
+from app.ai.code_review import get_configured_repos, run_code_review, run_pr_review
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +192,8 @@ def _pr_review_summary(row: PRReview) -> dict:
         "base_branch":         row.base_branch,
         "head_branch":         row.head_branch,
         "linked_tickets":      row.linked_tickets or [],
+        "linked_story_key":    row.linked_story_key,
+        "requirement_context": row.requirement_context or {},
         "changed_files_count": len(row.changed_files or []),
         "status":              row.status,
         "total_count":         row.total_count,
@@ -244,3 +247,139 @@ def get_pr_review(
         "changed_files": review.changed_files or [],
         "findings": review.findings or [],
     }
+
+
+class LinkStoryRequest(BaseModel):
+    ticket_key: str
+    reanalyze: bool = True
+
+
+def _ticket_requirement_context(ticket: JiraTicket) -> dict:
+    return {
+        "key": ticket.jira_key,
+        "summary": ticket.summary,
+        "description": ticket.description,
+        "status": ticket.status,
+        "issue_type": ticket.issue_type,
+        "priority": ticket.priority,
+        "story_points": ticket.story_points,
+        "labels": ticket.labels or [],
+        "pod": ticket.pod,
+        "client": ticket.client,
+    }
+
+
+def _severity_counts(findings: list[dict]) -> tuple[int, int, int]:
+    critical = sum(1 for f in findings if f.get("severity") == "critical")
+    high = sum(1 for f in findings if f.get("severity") == "high")
+    medium = sum(1 for f in findings if f.get("severity") == "medium")
+    return critical, high, medium
+
+
+async def _reanalyze_pr_review(review_id: str, org_id: str) -> None:
+    from app.core.database import SessionLocal
+
+    db = SessionLocal()
+    try:
+        review = (
+            db.query(PRReview)
+            .filter(PRReview.id == review_id, PRReview.org_id == org_id)
+            .first()
+        )
+        if not review:
+            return
+        review.status = "analyzing"
+        db.commit()
+
+        findings, changed_files = await run_pr_review(
+            review.github_repo,
+            review.pr_number,
+            review.requirement_context or None,
+        )
+        critical, high, medium = _severity_counts(findings)
+        review.findings = findings
+        review.changed_files = changed_files
+        review.total_count = len(findings)
+        review.critical_count = critical
+        review.high_count = high
+        review.medium_count = medium
+        review.status = "done"
+        review.analyzed_at = datetime.utcnow()
+        db.commit()
+    except Exception:
+        db.rollback()
+        review = db.query(PRReview).filter(PRReview.id == review_id, PRReview.org_id == org_id).first()
+        if review:
+            review.status = "failed"
+            review.analyzed_at = datetime.utcnow()
+            db.commit()
+    finally:
+        db.close()
+
+
+@router.post("/pr-reviews/{review_id}/link-story")
+def link_pr_review_story(
+    review_id: str,
+    body: LinkStoryRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    review = (
+        db.query(PRReview)
+        .filter(PRReview.id == review_id, PRReview.org_id == str(current_user.org_id))
+        .first()
+    )
+    if not review:
+        raise HTTPException(status_code=404, detail="PR review not found")
+
+    ticket = (
+        db.query(JiraTicket)
+        .filter(
+            JiraTicket.org_id == str(current_user.org_id),
+            JiraTicket.jira_key == body.ticket_key.strip().upper(),
+            JiraTicket.is_deleted == False,
+        )
+        .first()
+    )
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Story not found")
+
+    context = _ticket_requirement_context(ticket)
+    review.linked_story_key = ticket.jira_key
+    review.requirement_context = context
+    if ticket.jira_key not in (review.linked_tickets or []):
+        review.linked_tickets = sorted([*(review.linked_tickets or []), ticket.jira_key])
+    if body.reanalyze:
+        review.status = "pending"
+    db.commit()
+    db.refresh(review)
+
+    if body.reanalyze:
+        background_tasks.add_task(_reanalyze_pr_review, review.id, str(current_user.org_id))
+
+    return {
+        **_pr_review_summary(review),
+        "changed_files": review.changed_files or [],
+        "findings": review.findings or [],
+    }
+
+
+@router.post("/pr-reviews/{review_id}/reanalyze")
+def reanalyze_pr_review(
+    review_id: str,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    review = (
+        db.query(PRReview)
+        .filter(PRReview.id == review_id, PRReview.org_id == str(current_user.org_id))
+        .first()
+    )
+    if not review:
+        raise HTTPException(status_code=404, detail="PR review not found")
+    review.status = "pending"
+    db.commit()
+    background_tasks.add_task(_reanalyze_pr_review, review.id, str(current_user.org_id))
+    return {"ok": True, "review_id": review.id, "status": review.status}

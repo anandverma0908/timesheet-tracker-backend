@@ -75,7 +75,11 @@ async def run_pr_review_and_save(review_id: str) -> None:
         review.status = "analyzing"
         db.commit()
 
-        findings, changed_files = await run_pr_review(review.github_repo, review.pr_number)
+        findings, changed_files = await run_pr_review(
+            review.github_repo,
+            review.pr_number,
+            review.requirement_context or None,
+        )
         critical, high, medium = _severity_counts(findings)
 
         review.findings = findings

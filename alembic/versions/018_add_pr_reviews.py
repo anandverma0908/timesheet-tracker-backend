@@ -31,6 +31,8 @@ def upgrade() -> None:
         sa.Column("base_branch", sa.String(length=500), nullable=True),
         sa.Column("head_branch", sa.String(length=500), nullable=True),
         sa.Column("linked_tickets", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default=sa.text("'[]'::jsonb")),
+        sa.Column("linked_story_key", sa.String(length=50), nullable=True),
+        sa.Column("requirement_context", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default=sa.text("'{}'::jsonb")),
         sa.Column("changed_files", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default=sa.text("'[]'::jsonb")),
         sa.Column("status", sa.String(length=50), nullable=False, server_default="pending"),
         sa.Column("findings", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default=sa.text("'[]'::jsonb")),

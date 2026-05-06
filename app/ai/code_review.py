@@ -20,6 +20,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
+from typing import Optional
 
 import httpx
 
@@ -105,12 +106,16 @@ You are EOS reviewing a pull request to `{github_repo}`.
 PR #{pr_number}: "{title}" by {author}
 Branch: {head_branch} -> {base_branch}
 
+Requirement / story context:
+{requirement_context}
+
 These files were changed in this PR. Each section includes GitHub's unified diff patch and, when available, the current file content at the PR head.
 
 {file_context}
 
 Find only high-signal findings introduced or exposed by these changes. Include:
 - bugs and regressions
+- requirement mismatches, missing acceptance criteria, and incomplete implementation against the linked story
 - performance or scalability issues
 - security/data-leak risks
 - broken existing contracts between frontend/backend/modules
@@ -517,7 +522,27 @@ async def run_code_review(github_repo: str) -> tuple[list[dict], str, list[str]]
     return final, snapshot_id, scanned_files
 
 
-async def run_pr_review(github_repo: str, pr_number: int) -> tuple[list[dict], list[str]]:
+def _format_requirement_context(requirement_context: Optional[dict]) -> str:
+    if not requirement_context:
+        return "No story was linked. Review against the PR title/body and changed code contracts."
+    parts = [
+        f"Story: {requirement_context.get('key') or 'linked story'}",
+        f"Title: {requirement_context.get('summary') or ''}",
+        f"Status: {requirement_context.get('status') or ''}",
+        f"Type: {requirement_context.get('issue_type') or ''}",
+        f"Priority: {requirement_context.get('priority') or ''}",
+        f"Story points: {requirement_context.get('story_points') or ''}",
+        "Description:",
+        str(requirement_context.get("description") or "No description provided."),
+    ]
+    return "\n".join(parts)
+
+
+async def run_pr_review(
+    github_repo: str,
+    pr_number: int,
+    requirement_context: Optional[dict] = None,
+) -> tuple[list[dict], list[str]]:
     """
     Review only files changed in a GitHub pull request using diff-focused EOS analysis.
 
@@ -542,6 +567,7 @@ async def run_pr_review(github_repo: str, pr_number: int) -> tuple[list[dict], l
         author=(pull.get("user") or {}).get("login") or "unknown",
         head_branch=(pull.get("head") or {}).get("ref") or "",
         base_branch=(pull.get("base") or {}).get("ref") or "",
+        requirement_context=_format_requirement_context(requirement_context),
         file_context=file_context,
     )
 

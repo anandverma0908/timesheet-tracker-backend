@@ -94,6 +94,12 @@ async def lifespan(app: FastAPI):
             _conn.execute(text(
                 "ALTER TABLE code_review_snapshots ADD COLUMN IF NOT EXISTS label VARCHAR(500)"
             ))
+            _conn.execute(text(
+                "ALTER TABLE pr_reviews ADD COLUMN IF NOT EXISTS linked_story_key VARCHAR(50)"
+            ))
+            _conn.execute(text(
+                "ALTER TABLE pr_reviews ADD COLUMN IF NOT EXISTS requirement_context JSONB NOT NULL DEFAULT '{}'::jsonb"
+            ))
             _conn.commit()
             logger.info("pgvector extension and embedding columns verified")
         except Exception as _e:

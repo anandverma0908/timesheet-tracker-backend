@@ -24,6 +24,8 @@ class PRReview(Base, TimestampMixin):
     base_branch     = Column(String(500), nullable=True)
     head_branch     = Column(String(500), nullable=True)
     linked_tickets  = Column(JSONB, nullable=False, default=list)
+    linked_story_key = Column(String(50), nullable=True)
+    requirement_context = Column(JSONB, nullable=False, default=dict)
     changed_files   = Column(JSONB, nullable=False, default=list)
     status          = Column(String(50), nullable=False, default="pending")
     findings        = Column(JSONB, nullable=False, default=list)
